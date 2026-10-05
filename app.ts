@@ -13,23 +13,26 @@ class BizError extends Error {} // 业务拒绝 -> 退出码 1
 class DataError extends Error {} // 数据读取/保存失败 -> 退出码 1
 
 type DocType = 'in' | 'out' | 'transfer';
+type EntryType = DocType | 'reversal';
 
 interface LedgerEntry {
   seq: number; // 全局流水序号，即提交顺序
-  doc: string; // 单据编号
-  type: DocType;
+  doc: string; // 单据编号（冲销流水为冲销单编号）
+  type: EntryType;
   product: string;
   wh: string; // 本流水条目变动余量的仓库
   qty: number; // 恒为正数，方向由 type / 出入仓决定
   before: number;
   after: number;
-  from?: string; // 调拨单的调出仓
+  from?: string; // 调拨单的调出仓（冲销调拨时沿用原单方向）
   to?: string; // 调拨单的调入仓
+  ref?: string; // 冲销流水关联的原单编号
 }
 
 interface DocRecord {
   content: Record<string, unknown>; // 规范化业务内容（明细顺序无关）
   resultLines: string[]; // 原提交结果，供幂等重放
+  reversedBy?: string; // 原单被成功冲销的冲销单编号（仅原始单据可能有）
 }
 
 interface Store {
@@ -40,8 +43,15 @@ interface Store {
   docs: Record<string, DocRecord>;
 }
 
+// 各映射一律使用无原型对象，constructor、__proto__ 等标识不会命中原型链
 function emptyStore(): Store {
-  return { version: 1, products: {}, stock: {}, entries: [], docs: {} };
+  return {
+    version: 1,
+    products: Object.create(null),
+    stock: Object.create(null),
+    entries: [],
+    docs: Object.create(null),
+  };
 }
 
 // ---------- 工具 ----------
@@ -104,35 +114,69 @@ function loadStore(dataDir: string): Store {
   return validateStore(data);
 }
 
+type BadData = (msg: string) => DataError;
+
+/** 校验去重记录中的规范化业务内容，冲销时需据此重放原单明细。 */
+function validateDocContent(docId: string, content: Record<string, unknown>, bad: BadData): void {
+  const t = content.type;
+  if (t === 'reverse') {
+    if (typeof content.of !== 'string' || content.of.trim() === '')
+      throw bad(`冲销单 ${docId} 缺少原单编号`);
+    return;
+  }
+  if (t !== 'in' && t !== 'out' && t !== 'transfer') throw bad(`单据 ${docId} 的业务类型非法`);
+  if (t === 'transfer') {
+    if (
+      typeof content.from !== 'string' || content.from.trim() === '' ||
+      typeof content.to !== 'string' || content.to.trim() === ''
+    ) throw bad(`调拨单 ${docId} 缺少调出/调入仓`);
+  } else if (typeof content.wh !== 'string' || content.wh.trim() === '') {
+    throw bad(`单据 ${docId} 缺少仓库标识`);
+  }
+  if (!isPlainObject(content.items)) throw bad(`单据 ${docId} 的明细非法`);
+  for (const [pid, qty] of Object.entries(content.items)) {
+    if (pid.trim() === '' || !isPosSafeInt(qty)) throw bad(`单据 ${docId} 的明细数量非法`);
+  }
+}
+
 function validateStore(data: unknown): Store {
-  const bad = (msg: string): DataError =>
+  const bad: BadData = (msg) =>
     new DataError(`数据文件已损坏或格式不正确（${msg}），拒绝启动以免覆盖原数据`);
 
   if (!isPlainObject(data)) throw bad('根节点不是对象');
   if (data.version !== 1) throw bad(`不支持的数据版本：${String(data.version)}`);
 
   if (!isPlainObject(data.products)) throw bad('products 不是对象');
+  const products: Record<string, string> = Object.create(null);
   for (const [id, name] of Object.entries(data.products)) {
-    if (typeof id !== 'string' || id.trim() === '' || typeof name !== 'string')
+    if (id.trim() === '' || typeof name !== 'string')
       throw bad('products 中存在非法编号或名称');
+    products[id] = name;
   }
 
   if (!isPlainObject(data.stock)) throw bad('stock 不是对象');
+  const stock: Store['stock'] = Object.create(null);
   for (const [pid, whs] of Object.entries(data.stock)) {
+    if (pid.trim() === '') throw bad('stock 中存在非法商品编号');
     if (!isPlainObject(whs)) throw bad(`商品 ${pid} 的库存不是对象`);
+    const inner: Record<string, number> = Object.create(null);
     for (const [wh, qty] of Object.entries(whs)) {
-      if (typeof wh !== 'string' || wh.trim() === '' || !isNonNegSafeInt(qty))
-        throw bad(`商品 ${pid} 仓库 ${String(wh)} 的余量非法`);
+      if (wh.trim() === '' || !isNonNegSafeInt(qty))
+        throw bad(`商品 ${pid} 仓库 ${wh} 的余量非法`);
+      inner[wh] = qty;
     }
+    stock[pid] = inner;
   }
 
   if (!Array.isArray(data.entries)) throw bad('entries 不是数组');
+  const entries: LedgerEntry[] = [];
   let lastSeq = 0;
   for (const e of data.entries as unknown[]) {
     if (!isPlainObject(e)) throw bad('存在非法流水条目');
     if (!isPosSafeInt(e.seq) || e.seq !== ++lastSeq) throw bad('流水序号不连续');
     if (typeof e.doc !== 'string' || e.doc.trim() === '') throw bad('流水缺少单据编号');
-    if (e.type !== 'in' && e.type !== 'out' && e.type !== 'transfer') throw bad('流水类型非法');
+    if (e.type !== 'in' && e.type !== 'out' && e.type !== 'transfer' && e.type !== 'reversal')
+      throw bad('流水类型非法');
     if (typeof e.product !== 'string' || e.product.trim() === '') throw bad('流水缺少商品编号');
     if (typeof e.wh !== 'string' || e.wh.trim() === '') throw bad('流水缺少仓库标识');
     if (!isPosSafeInt(e.qty)) throw bad('流水数量非法');
@@ -141,17 +185,30 @@ function validateStore(data: unknown): Store {
       if (typeof e.from !== 'string' || e.from.trim() === '' || typeof e.to !== 'string' || e.to.trim() === '')
         throw bad('调拨流水缺少调出/调入仓');
     }
+    if (e.type === 'reversal') {
+      if (typeof e.ref !== 'string' || e.ref.trim() === '') throw bad('冲销流水缺少原单编号');
+      if (e.from !== undefined && (typeof e.from !== 'string' || e.from.trim() === ''))
+        throw bad('冲销流水的调出仓非法');
+      if (e.to !== undefined && (typeof e.to !== 'string' || e.to.trim() === ''))
+        throw bad('冲销流水的调入仓非法');
+    }
+    entries.push(e as unknown as LedgerEntry);
   }
 
   if (!isPlainObject(data.docs)) throw bad('docs 不是对象');
+  const docs: Record<string, DocRecord> = Object.create(null);
   for (const [docId, rec] of Object.entries(data.docs)) {
-    if (typeof docId !== 'string' || docId.trim() === '') throw bad('存在非法单据编号');
+    if (docId.trim() === '') throw bad('存在非法单据编号');
     if (!isPlainObject(rec) || !isPlainObject(rec.content) || !Array.isArray(rec.resultLines))
       throw bad(`单据 ${docId} 的去重记录非法`);
     if (!rec.resultLines.every((l) => typeof l === 'string')) throw bad(`单据 ${docId} 的结果记录非法`);
+    validateDocContent(docId, rec.content, bad);
+    if (rec.reversedBy !== undefined && (typeof rec.reversedBy !== 'string' || rec.reversedBy.trim() === ''))
+      throw bad(`单据 ${docId} 的冲销标记非法`);
+    docs[docId] = rec as unknown as DocRecord;
   }
 
-  return data as unknown as Store;
+  return { version: 1, products, stock, entries, docs };
 }
 
 function saveStore(dataDir: string, store: Store): void {
@@ -270,7 +327,18 @@ function getStock(stock: Store['stock'], pid: string, wh: string): number {
 }
 
 function setStock(stock: Store['stock'], pid: string, wh: string, qty: number): void {
-  (stock[pid] ??= {})[wh] = qty;
+  (stock[pid] ??= Object.create(null))[wh] = qty;
+}
+
+/** 深拷贝库存映射（保持无原型对象），供整单模拟使用。 */
+function cloneStock(stock: Store['stock']): Store['stock'] {
+  const out: Store['stock'] = Object.create(null);
+  for (const [pid, whs] of Object.entries(stock)) {
+    const inner: Record<string, number> = Object.create(null);
+    for (const [wh, qty] of Object.entries(whs)) inner[wh] = qty;
+    out[pid] = inner;
+  }
+  return out;
 }
 
 interface SubmitOutcome {
@@ -292,7 +360,7 @@ function submitDocument(dataDir: string, store: Store, req: DocRequest): SubmitO
     if (store.products[pid] === undefined) throw new BizError(`商品未登记，拒绝整单：${pid}`);
   }
 
-  const draft: Store['stock'] = structuredClone(store.stock);
+  const draft: Store['stock'] = cloneStock(store.stock);
   const additions: LedgerEntry[] = [];
   const reportLines: string[] = [];
   let seq = store.entries.length;
@@ -353,6 +421,116 @@ function submitDocument(dataDir: string, store: Store, req: DocRequest): SubmitO
   return {
     duplicate: false,
     lines: [`${typeLabel}单 ${req.docId} 提交成功，共 ${req.items.size} 种商品：`, ...reportLines],
+  };
+}
+
+// ---------- 整单冲销 ----------
+
+interface ReversalRequest {
+  docId: string; // 冲销单编号（与入/出/调拨单共用同一编号空间）
+  of: string; // 被冲销的原单编号
+}
+
+function parseReverseArgs(tokens: string[]): ReversalRequest {
+  const args = parseArgs(tokens, []);
+  const [idRaw, ofRaw, ...extra] = args.positionals;
+  if (idRaw === undefined || ofRaw === undefined || extra.length > 0)
+    throw new UsageError('用法：reverse <冲销单编号> <原单编号>');
+  return { docId: trimOrThrow('冲销单编号', idRaw), of: trimOrThrow('原单编号', ofRaw) };
+}
+
+/**
+ * 整单冲销：按原单合并后的明细在当前余量上应用相反变动（入库扣回、出库补回、
+ * 调拨从调入仓扣回并向调出仓补回）。先整体校验、模拟，全部合法才一次性落库；
+ * 任一明细扣回不足或补回溢出则整单拒绝，所有仓库与商品保持原状。
+ */
+function submitReversal(dataDir: string, store: Store, req: ReversalRequest): SubmitOutcome {
+  const content: Record<string, unknown> = { type: 'reverse', of: req.of };
+  const existed = store.docs[req.docId];
+  if (existed !== undefined) {
+    if (stableStringify(existed.content) !== stableStringify(content))
+      throw new BizError(`单据编号 ${req.docId} 已用于业务内容不同的单据，拒绝提交`);
+    return { duplicate: true, lines: existed.resultLines }; // 幂等重放：即使余量已变也不再变动
+  }
+
+  const orig = store.docs[req.of];
+  if (orig === undefined) throw new BizError(`原单 ${req.of} 不存在，无法冲销`);
+  const oc = orig.content;
+  if (oc.type === 'reverse') throw new BizError(`原单 ${req.of} 本身是冲销单，不能对冲销单再冲销`);
+  const otype = oc.type as DocType; // 加载时已校验，必为 in/out/transfer
+  if (orig.reversedBy !== undefined)
+    throw new BizError(`原单 ${req.of} 已被冲销单 ${orig.reversedBy} 成功冲销，每张原单最多冲销一次`);
+
+  const items = oc.items as Record<string, number>; // 原单合并后的明细
+  const draft: Store['stock'] = cloneStock(store.stock);
+  const additions: LedgerEntry[] = [];
+  const reportLines: string[] = [];
+  let seq = store.entries.length;
+
+  for (const pid of Object.keys(items).sort()) {
+    const qty = items[pid];
+
+    if (otype === 'in') {
+      // 冲销入库：从原目标仓扣回
+      const wh = oc.wh as string;
+      const before = getStock(draft, pid, wh);
+      if (before < qty)
+        throw new BizError(`冲销入库：商品 ${pid} 仓库 ${wh} 余量不足（当前 ${before}，需扣回 ${qty}），整单拒绝`);
+      const after = before - qty;
+      setStock(draft, pid, wh, after);
+      additions.push({ seq: ++seq, doc: req.docId, type: 'reversal', product: pid, wh, qty, before, after, ref: req.of });
+      reportLines.push(`冲销入库 ${pid} @${wh} -${qty}：${before} -> ${after}`);
+    } else if (otype === 'out') {
+      // 冲销出库：向原来源仓补回
+      const wh = oc.wh as string;
+      const before = getStock(draft, pid, wh);
+      const after = before + qty;
+      if (after > MAX_SAFE)
+        throw new BizError(`冲销出库：商品 ${pid} 仓库 ${wh} 补回后余量超出安全整数范围，整单拒绝`);
+      setStock(draft, pid, wh, after);
+      additions.push({ seq: ++seq, doc: req.docId, type: 'reversal', product: pid, wh, qty, before, after, ref: req.of });
+      reportLines.push(`冲销出库 ${pid} @${wh} +${qty}：${before} -> ${after}`);
+    } else {
+      // 冲销调拨：从原调入仓扣回，向原调出仓补回
+      const from = oc.from as string;
+      const to = oc.to as string;
+      const beforeTo = getStock(draft, pid, to);
+      if (beforeTo < qty)
+        throw new BizError(`冲销调拨：商品 ${pid} 调入仓 ${to} 余量不足（当前 ${beforeTo}，需扣回 ${qty}），整单拒绝`);
+      const afterTo = beforeTo - qty;
+      const beforeFrom = getStock(draft, pid, from);
+      const afterFrom = beforeFrom + qty;
+      if (afterFrom > MAX_SAFE)
+        throw new BizError(`冲销调拨：商品 ${pid} 调出仓 ${from} 补回后余量超出安全整数范围，整单拒绝`);
+      setStock(draft, pid, to, afterTo);
+      setStock(draft, pid, from, afterFrom);
+      additions.push({
+        seq: ++seq, doc: req.docId, type: 'reversal', product: pid, wh: to,
+        qty, before: beforeTo, after: afterTo, from, to, ref: req.of,
+      });
+      additions.push({
+        seq: ++seq, doc: req.docId, type: 'reversal', product: pid, wh: from,
+        qty, before: beforeFrom, after: afterFrom, from, to, ref: req.of,
+      });
+      reportLines.push(
+        `冲销调拨 ${pid} ${to} -> ${from} ${qty}：${to} ${beforeTo}->${afterTo}；${from} ${beforeFrom}->${afterFrom}`,
+      );
+    }
+  }
+
+  // 全部明细合法：一次性提交，库存、流水、冲销关系与去重记录一起保存后才算成功
+  store.stock = draft;
+  store.entries.push(...additions);
+  store.docs[req.docId] = { content, resultLines: reportLines };
+  orig.reversedBy = req.docId;
+  saveStore(dataDir, store);
+
+  return {
+    duplicate: false,
+    lines: [
+      `冲销单 ${req.docId} 提交成功，已冲销${TYPE_LABEL[otype]}单 ${req.of}，共 ${Object.keys(items).length} 种商品：`,
+      ...reportLines,
+    ],
   };
 }
 
@@ -417,15 +595,20 @@ function runBalance(rest: string[], store: Store): void {
   console.log(`合计：${total}`);
 }
 
-const TYPE_LABEL: Record<DocType, string> = { in: '入库', out: '出库', transfer: '调拨' };
+const TYPE_LABEL: Record<EntryType, string> = { in: '入库', out: '出库', transfer: '调拨', reversal: '冲销' };
 
-function formatEntry(e: LedgerEntry): string {
+function formatEntry(e: LedgerEntry, store: Store): string {
   let signed: string;
   if (e.type === 'in') signed = `+${e.qty}`;
   else if (e.type === 'out') signed = `-${e.qty}`;
+  else if (e.type === 'reversal') signed = `${e.after >= e.before ? '+' : '-'}${e.qty}`;
   else signed = `${e.wh === e.to ? '+' : '-'}${e.qty}`;
   let line = `#${e.seq}\t单据=${e.doc}\t${TYPE_LABEL[e.type]}\t商品=${e.product}\t仓库=${e.wh}\t${signed}\t${e.before}->${e.after}`;
-  if (e.type === 'transfer') line += `\t调拨=${e.from}->${e.to}`;
+  if (e.type === 'transfer' || (e.type === 'reversal' && e.from !== undefined && e.to !== undefined))
+    line += `\t调拨=${e.from}->${e.to}`;
+  if (e.type === 'reversal') line += `\t冲销原单=${e.ref}`;
+  const reversedBy = store.docs[e.doc]?.reversedBy;
+  if (reversedBy !== undefined) line += `\t（该单已被冲销单 ${reversedBy} 冲销）`;
   return line;
 }
 
@@ -447,7 +630,7 @@ function runFlow(rest: string[], store: Store): void {
     .join(' ');
   console.log(`流水（${scope}），共 ${rows.length} 条，按提交顺序：`);
   if (rows.length === 0) console.log('（无匹配流水）');
-  else for (const e of rows) console.log(formatEntry(e));
+  else for (const e of rows) console.log(formatEntry(e, store));
 }
 
 // ---------- 帮助与入口 ----------
@@ -467,6 +650,7 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   out <单据编号> --wh <仓库> --item <编号:数量> [...]      出库（余量不足整单拒绝）
   transfer <单据编号> --from <源仓> --to <目标仓> \\
            --item <编号:数量> [...]                        跨仓调拨（两仓不能相同）
+  reverse <冲销单编号> <原单编号>            整单冲销已成功的入库/出库/调拨单
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
        | --wh <仓库> [--product <编号>]
@@ -476,12 +660,17 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   数量必须为正安全整数；同单同商品的重复明细先合并，再做足量与溢出校验；
   任一明细不合法则整单拒绝。单据编号在同一数据目录内全局唯一，相同内容重复
   提交返回原结果且不重复变动，同编号不同内容拒绝；失败提交不占用编号。
+  冲销按原单合并后的明细在当前余量上应用相反变动：冲销入库从原目标仓扣回，
+  冲销出库向原来源仓补回，冲销调拨从原调入仓扣回并向原调出仓补回；只能冲销
+  成功的原始单据，每张原单最多成功冲销一次，冲销单编号与业务单据共用同一
+  编号空间；失败的冲销不占编号、不标记原单，条件改善后可重试。
 
 示例：
   node app.ts -d ./data product add P1 螺丝
   node app.ts -d ./data in D1 --wh W1 --item P1:10 --item P2:3
   node app.ts -d ./data out D2 --wh W1 --item P1:4
   node app.ts -d ./data transfer D3 --from W1 --to W2 --item P1:2 --item P1:3
+  node app.ts -d ./data reverse R1 D2
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
   node app.ts -d ./data flow --product P1
@@ -532,6 +721,16 @@ function run(argv: string[]): void {
       const outcome = submitDocument(dataDir, store, req);
       if (outcome.duplicate) {
         console.log(`单据 ${req.docId} 为重复提交，业务内容与原提交一致，返回原提交结果（库存与流水不变）：`);
+      }
+      for (const line of outcome.lines) console.log(line);
+      break;
+    }
+    case 'reverse': {
+      const req = parseReverseArgs(tokens);
+      const store = loadStore(dataDir);
+      const outcome = submitReversal(dataDir, store, req);
+      if (outcome.duplicate) {
+        console.log(`冲销单 ${req.docId} 为重复提交，与原冲销请求一致，返回原冲销结果（库存与流水不变）：`);
       }
       for (const line of outcome.lines) console.log(line);
       break;
