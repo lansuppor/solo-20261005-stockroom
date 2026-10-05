@@ -448,8 +448,8 @@ interface SubmitOutcome {
   lines: string[];
 }
 
-/** 整单先校验、模拟，全部合法后才一次性落库；任一明细失败则全部保持原状。 */
-function submitDocument(dataDir: string, store: Store, req: DocRequest): SubmitOutcome {
+/** 整单先校验、模拟，全部合法后才一次性应用到内存（不保存）；任一明细失败则全部保持原状。 */
+function applyDocument(store: Store, req: DocRequest): SubmitOutcome {
   const content = canonicalContent(req);
   const existed = store.docs[req.docId];
   if (existed !== undefined) {
@@ -517,11 +517,10 @@ function submitDocument(dataDir: string, store: Store, req: DocRequest): SubmitO
     }
   }
 
-  // 全部明细合法：一次性提交并在保存成功后才算成功
+  // 全部明细合法：一次性应用到内存（由调用方决定何时保存）
   store.stock = draft;
   store.entries.push(...additions);
   store.docs[req.docId] = { content, resultLines: reportLines };
-  saveStore(dataDir, store);
 
   return {
     duplicate: false,
@@ -544,7 +543,7 @@ function canonicalCountContent(req: CountRequest): Record<string, unknown> {
  * 可增、可减、可为零），未列出的商品及其他仓库不变。同编号同内容重放只返回原
  * 结果，即使余量改变或盘点已冲销也不再核对、不再生效。
  */
-function submitCount(dataDir: string, store: Store, req: CountRequest): SubmitOutcome {
+function applyCount(store: Store, req: CountRequest): SubmitOutcome {
   const content = canonicalCountContent(req);
   const existed = store.docs[req.docId];
   if (existed !== undefined) {
@@ -592,11 +591,10 @@ function submitCount(dataDir: string, store: Store, req: CountRequest): SubmitOu
     );
   }
 
-  // 全部明细合法：一次性提交并在保存成功后才算成功
+  // 全部明细合法：一次性应用到内存（由调用方决定何时保存）
   store.stock = draft;
   store.entries.push(...additions);
   store.docs[req.docId] = { content, resultLines: reportLines };
-  saveStore(dataDir, store);
 
   return {
     duplicate: false,
@@ -607,9 +605,9 @@ function submitCount(dataDir: string, store: Store, req: CountRequest): SubmitOu
 /**
  * 整单冲销：在“当前余量”上应用原单的相反变动（不回滚历史、不恢复绝对余量）。
  * 任一商品扣回不足或补回后溢出，则整单拒绝、不留任何痕迹；成功后库存/流水/冲销
- * 关系/结果一起原子保存。
+ * 关系/结果一起应用到内存（由调用方决定何时保存）。
  */
-function submitReversal(dataDir: string, store: Store, revId: string, origId: string): SubmitOutcome {
+function applyReversal(store: Store, revId: string, origId: string): SubmitOutcome {
   const existed = store.reversals[revId];
   if (existed !== undefined) {
     if (existed.orig !== origId)
@@ -733,11 +731,10 @@ function submitReversal(dataDir: string, store: Store, revId: string, origId: st
     }
   }
 
-  // 全部明细合法：库存、流水、冲销关系、结果一次性提交，保存成功才算成功
+  // 全部明细合法：库存、流水、冲销关系、结果一次性应用到内存（由调用方决定何时保存）
   store.stock = draft;
   store.entries.push(...additions);
   store.reversals[revId] = { orig: origId, resultLines: reportLines };
-  saveStore(dataDir, store);
 
   return {
     duplicate: false,
@@ -882,13 +879,164 @@ function runReverse(rest: string[], dataDir: string, store: Store): void {
     throw new UsageError('冲销必须通过 --orig <原单编号> 指定被冲销的原单');
   const revId = trimOrThrow('冲销单编号', revRaw);
   const origId = trimOrThrow('原单编号', args.flags['--orig']);
-  const outcome = submitReversal(dataDir, store, revId, origId);
+  const outcome = applyReversal(store, revId, origId);
+  if (!outcome.duplicate) saveStore(dataDir, store); // 保存成功才报告成功
   if (outcome.duplicate) {
     console.log(
       `冲销单 ${revId} 为重复提交，原单为 ${origId}，返回原冲销结果（库存与流水不再变动）：`,
     );
   }
   for (const line of outcome.lines) console.log(line);
+}
+
+// ---------- 整批导入 ----------
+
+type BatchItem =
+  | { kind: 'doc'; req: DocRequest }
+  | { kind: 'count'; req: CountRequest }
+  | { kind: 'reverse'; revId: string; origId: string };
+
+/** 解析入出库/调拨明细数组：同商品先合并，数量须为正安全整数。 */
+function parseBatchQtyItems(raw: unknown, at: string): Map<string, number> {
+  if (!Array.isArray(raw) || raw.length === 0)
+    throw new BizError(`${at}：items 必须是非空数组，元素为 {"product":"商品编号","qty":数量}`);
+  const merged = new Map<string, number>();
+  for (const it of raw as unknown[]) {
+    if (!isPlainObject(it) || typeof it.product !== 'string')
+      throw new BizError(`${at}：明细必须是 {"product":"商品编号","qty":数量} 对象`);
+    const pid = trimOrThrow(`${at} 的商品编号`, it.product);
+    if (!isPosSafeInt(it.qty))
+      throw new BizError(`${at}：商品 ${pid} 的数量必须为正安全整数：${JSON.stringify(it.qty)}`);
+    const sum = (merged.get(pid) ?? 0) + it.qty; // 同单同商品先合并
+    if (!Number.isSafeInteger(sum)) throw new BizError(`${at}：商品 ${pid} 累计数量超出安全整数范围`);
+    merged.set(pid, sum);
+  }
+  return merged;
+}
+
+/** 解析盘点明细数组：两种数量均为非负安全整数，同商品重复拒绝。 */
+function parseBatchCountItems(raw: unknown, at: string): Map<string, CountItem> {
+  if (!Array.isArray(raw) || raw.length === 0)
+    throw new BizError(
+      `${at}：items 必须是非空数组，元素为 {"product":"商品编号","expected":账面量,"actual":实盘量}`,
+    );
+  const items = new Map<string, CountItem>();
+  for (const it of raw as unknown[]) {
+    if (!isPlainObject(it) || typeof it.product !== 'string')
+      throw new BizError(`${at}：明细必须是 {"product":"商品编号","expected":账面量,"actual":实盘量} 对象`);
+    const pid = trimOrThrow(`${at} 的商品编号`, it.product);
+    if (!isNonNegSafeInt(it.expected))
+      throw new BizError(`${at}：商品 ${pid} 的预期账面量必须为非负安全整数：${JSON.stringify(it.expected)}`);
+    if (!isNonNegSafeInt(it.actual))
+      throw new BizError(`${at}：商品 ${pid} 的实盘量必须为非负安全整数：${JSON.stringify(it.actual)}`);
+    if (items.has(pid)) throw new BizError(`${at}：盘点单中商品 ${pid} 重复出现，拒绝整批`);
+    items.set(pid, { expected: it.expected, actual: it.actual });
+  }
+  return items;
+}
+
+function batchTrimId(raw: unknown, label: string, at: string): string {
+  if (typeof raw !== 'string') throw new BizError(`${at}：缺少${label}（字符串）`);
+  return trimOrThrow(`${at} 的${label}`, raw);
+}
+
+/** 解析列表中的一项；任何不合法都抛出带位置（第几项）的 BizError，整批拒绝。 */
+function parseBatchItem(raw: unknown, index: number): BatchItem {
+  const at = `第 ${index} 项`;
+  if (!isPlainObject(raw)) throw new BizError(`${at}：单据必须是对象`);
+  const t = raw.type;
+  if (t !== 'in' && t !== 'out' && t !== 'transfer' && t !== 'count' && t !== 'reverse')
+    throw new BizError(`${at}：type 必须是 in / out / transfer / count / reverse 之一`);
+  const docId = batchTrimId(raw.doc, '单据编号', at);
+
+  if (t === 'reverse') {
+    return { kind: 'reverse', revId: docId, origId: batchTrimId(raw.orig, '原单编号', at) };
+  }
+  if (t === 'count') {
+    const wh = batchTrimId(raw.wh, '仓库标识', at);
+    return { kind: 'count', req: { docId, wh, items: parseBatchCountItems(raw.items, at) } };
+  }
+  const items = parseBatchQtyItems(raw.items, at);
+  if (t === 'transfer') {
+    const from = batchTrimId(raw.from, '调出仓标识', at);
+    const to = batchTrimId(raw.to, '调入仓标识', at);
+    if (from === to) throw new BizError(`${at}：调拨单的调出仓与调入仓不能相同`);
+    return { kind: 'doc', req: { type: 'transfer', docId, from, to, items } };
+  }
+  const wh = batchTrimId(raw.wh, '仓库标识', at);
+  return { kind: 'doc', req: { type: t, docId, wh, items } };
+}
+
+/**
+ * 整批导入：按列表顺序逐项应用（后项以前项生效后的余量核对与计算），
+ * 任一项失败则整批拒绝、不保存任何本批变动；全部通过且有新生效单据时
+ * 一次性保存，保存成功后才输出各项结果；全部重复时不改写数据。
+ */
+function runImport(rest: string[], dataDir: string, store: Store): void {
+  const args = parseArgs(rest, []);
+  const [file, ...extra] = args.positionals;
+  if (file === undefined || extra.length > 0) throw new UsageError('用法：import <单据列表文件>');
+
+  let raw: string;
+  try {
+    raw = readFileSync(file, 'utf8');
+  } catch (e) {
+    throw new DataError(`无法读取导入文件 ${file}：${(e as Error).message}`);
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new UsageError(`导入文件不是合法 JSON：${file}`);
+  }
+  if (!Array.isArray(data)) throw new UsageError('导入文件必须是 JSON 数组（有序单据列表）');
+  if (data.length === 0) throw new UsageError('导入文件至少需要包含一项单据');
+
+  const items = data.map((it, i) => parseBatchItem(it, i + 1));
+
+  // 顺序应用：任一项抛出即整批拒绝，内存中的本批变动随进程退出全部丢弃，不保存
+  const applied: { item: BatchItem; outcome: SubmitOutcome }[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    try {
+      let outcome: SubmitOutcome;
+      if (item.kind === 'doc') outcome = applyDocument(store, item.req);
+      else if (item.kind === 'count') outcome = applyCount(store, item.req);
+      else outcome = applyReversal(store, item.revId, item.origId);
+      applied.push({ item, outcome });
+    } catch (e) {
+      if (e instanceof BizError) throw new BizError(`第 ${i + 1} 项：${e.message}`);
+      throw e;
+    }
+  }
+
+  const newCount = applied.filter((a) => !a.outcome.duplicate).length;
+  if (newCount > 0) saveStore(dataDir, store); // 有新生效单据：整批保存成功才报告成功
+
+  const docIdOf = (it: BatchItem): string =>
+    it.kind === 'reverse' ? it.revId : it.req.docId;
+  const labelOf = (it: BatchItem): string =>
+    it.kind === 'doc'
+      ? it.req.type === 'in'
+        ? '入库单'
+        : it.req.type === 'out'
+          ? '出库单'
+          : '调拨单'
+      : it.kind === 'count'
+        ? '盘点单'
+        : '冲销单';
+
+  console.log(
+    `整批导入 ${file}：共 ${items.length} 项，首次生效 ${newCount} 项，重复 ${items.length - newCount} 项` +
+      (newCount > 0 ? '，已整批保存' : '，全部为重复，数据未改写'),
+  );
+  applied.forEach(({ item, outcome }, i) => {
+    console.log(
+      `[${i + 1}] ${labelOf(item)} ${docIdOf(item)}：` +
+        (outcome.duplicate ? '重复，返回原结果（不再生效）' : '首次生效'),
+    );
+    for (const line of outcome.lines) console.log(line);
+  });
 }
 
 // ---------- 帮助与入口 ----------
@@ -911,6 +1059,7 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   count <单据编号> --wh <仓库> \\
         --item <编号:预期账面量:实盘量> [...]              整单盘点校正（先核对账面再按实盘校正）
   reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点单
+  import <文件>                             整批导入：从 JSON 文件按顺序提交有序单据列表
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
        | --wh <仓库> [--product <编号>]
@@ -941,6 +1090,24 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   销，每张原单最多冲销一次。冲销成功后重放原单仍只返回其最初结果，不会重新生
   效；重放冲销单返回原冲销结果，不再变动，同编号改指其他原单则拒绝。
 
+整批导入（import）：
+  import <文件> 从 JSON 文件读取有序单据列表，按列表顺序逐项提交：后项以前项
+  生效后的余量核对并计算（后项可用前项入库所得库存，盘点核对此前各项之后的
+  账面量，冲销可指向导入前已成功的原单或列表中此前的新原单）。文件必须是非空
+  JSON 数组，元素为下列对象之一（标识去首尾空白后非空、区分大小写）：
+    {"type":"in"|"out","doc":"编号","wh":"仓库",
+     "items":[{"product":"商品编号","qty":数量}, ...]}
+    {"type":"transfer","doc":"编号","from":"调出仓","to":"调入仓",
+     "items":[{"product":"商品编号","qty":数量}, ...]}
+    {"type":"count","doc":"编号","wh":"仓库",
+     "items":[{"product":"商品编号","expected":预期账面量,"actual":实盘量}, ...]}
+    {"type":"reverse","doc":"冲销单编号","orig":"原单编号"}
+  与单条命令共用唯一编号空间与去重规则：同编号同内容项（导入前已有或本列表
+  此前出现）只返回原结果、不重新生效；同编号不同内容或不同业务整批拒绝。
+  全部项通过才生效：有新生效单据时整批一次性保存，全部重复时不改写数据；
+  任一项不合法整批拒绝并指出位置与原因，本批新库存、流水、编号与冲销关系均
+  不保留，纠正后可复用这些新编号。
+
 示例：
   node app.ts -d ./data product add P1 螺丝
   node app.ts -d ./data in D1 --wh W1 --item P1:10 --item P2:3
@@ -949,6 +1116,7 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data count C1 --wh W1 --item P1:1:5 --item P2:3:3
   node app.ts -d ./data reverse R1 --orig D3
   node app.ts -d ./data reverse R2 --orig C1
+  node app.ts -d ./data import ./examples/import.json
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
   node app.ts -d ./data flow --product P1
@@ -996,7 +1164,8 @@ function run(argv: string[]): void {
     case 'transfer': {
       const req = parseDocArgs(cmd, tokens);
       const store = loadStore(dataDir);
-      const outcome = submitDocument(dataDir, store, req);
+      const outcome = applyDocument(store, req);
+      if (!outcome.duplicate) saveStore(dataDir, store); // 保存成功才报告成功
       if (outcome.duplicate) {
         console.log(`单据 ${req.docId} 为重复提交，业务内容与原提交一致，返回原提交结果（库存与流水不变）：`);
       }
@@ -1006,7 +1175,8 @@ function run(argv: string[]): void {
     case 'count': {
       const req = parseCountArgs(tokens);
       const store = loadStore(dataDir);
-      const outcome = submitCount(dataDir, store, req);
+      const outcome = applyCount(store, req);
+      if (!outcome.duplicate) saveStore(dataDir, store); // 保存成功才报告成功
       if (outcome.duplicate) {
         console.log(`盘点单 ${req.docId} 为重复提交，业务内容与原提交一致，返回原提交结果（库存与流水不变）：`);
       }
@@ -1016,6 +1186,11 @@ function run(argv: string[]): void {
     case 'reverse': {
       const store = loadStore(dataDir);
       runReverse(tokens, dataDir, store);
+      break;
+    }
+    case 'import': {
+      const store = loadStore(dataDir);
+      runImport(tokens, dataDir, store);
       break;
     }
     case 'balance': {

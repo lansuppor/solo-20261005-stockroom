@@ -1,0 +1,28 @@
+[
+  {
+    "type": "in",
+    "doc": "B1",
+    "wh": "W2",
+    "items": [
+      { "product": "P1", "qty": 10 },
+      { "product": "P1", "qty": 5 }
+    ]
+  },
+  {
+    "type": "out",
+    "doc": "B2",
+    "wh": "W2",
+    "items": [{ "product": "P1", "qty": 4 }]
+  },
+  {
+    "type": "count",
+    "doc": "B3",
+    "wh": "W2",
+    "items": [{ "product": "P1", "expected": 11, "actual": 12 }]
+  },
+  {
+    "type": "reverse",
+    "doc": "B4",
+    "orig": "B2"
+  }
+]
