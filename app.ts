@@ -13,7 +13,15 @@ class BizError extends Error {} // 业务拒绝 -> 退出码 1
 class DataError extends Error {} // 数据读取/保存失败 -> 退出码 1
 
 type DocType = 'in' | 'out' | 'transfer';
-type EntryType = DocType | 'count' | 'in-rev' | 'out-rev' | 'transfer-rev' | 'count-rev';
+type EntryType =
+  | DocType
+  | 'count'
+  | 'receive'
+  | 'in-rev'
+  | 'out-rev'
+  | 'transfer-rev'
+  | 'count-rev'
+  | 'receive-rev';
 
 interface LedgerEntry {
   seq: number; // 全局流水序号，即提交顺序
@@ -27,6 +35,7 @@ interface LedgerEntry {
   from?: string; // 调拨（或冲销调拨）的调出仓
   to?: string; // 调拨（或冲销调拨）的调入仓
   orig?: string; // 冲销流水：被冲销的原单编号
+  po?: string; // 到货（及冲销到货）流水：所属采购单编号
   expected?: number; // 盘点（及冲销盘点）流水：预期账面量
   actual?: number; // 盘点（及冲销盘点）流水：实盘量
   diff?: number; // 盘点差额 = 实盘 - 账面（可正、可负、可零）；冲销盘点流水记录原差额
@@ -42,13 +51,22 @@ interface ReversalRecord {
   resultLines: string[]; // 冲销提交结果，供幂等重放
 }
 
+interface PurchaseOrder {
+  supplier: string; // 供应商名称
+  wh: string; // 收货仓
+  items: Record<string, number>; // 商品 -> 订购量（同商品已合并）
+  received: Record<string, number>; // 商品 -> 有效到货量（未冲销累计，缺省为 0）
+  resultLines: string[]; // 登记结果，供幂等重放
+}
+
 interface Store {
   version: 1;
   products: Record<string, string>; // 编号 -> 名称（编号区分大小写；null 原型，防特殊键串改）
   stock: Record<string, Record<string, number>>; // 商品 -> 仓库 -> 余量
   entries: LedgerEntry[];
-  docs: Record<string, DocRecord>; // 入库/出库/调拨单去重与结果
+  docs: Record<string, DocRecord>; // 入库/出库/调拨/盘点/到货单去重与结果
   reversals: Record<string, ReversalRecord>; // 冲销单去重与结果
+  pos: Record<string, PurchaseOrder>; // 采购单（独立编号空间，与单据编号可同名）
 }
 
 function nullProto<T extends object>(): T {
@@ -63,6 +81,7 @@ function emptyStore(): Store {
     entries: [],
     docs: nullProto(),
     reversals: nullProto(),
+    pos: nullProto(),
   };
 }
 
@@ -164,8 +183,11 @@ function validateStore(data: unknown): Store {
     if (!isPosSafeInt(e.seq) || e.seq !== ++lastSeq) throw bad('流水序号不连续');
     if (typeof e.doc !== 'string' || e.doc.trim() === '') throw bad('流水缺少单据编号');
     const isRev =
-      e.type === 'in-rev' || e.type === 'out-rev' || e.type === 'transfer-rev' || e.type === 'count-rev';
-    const isOrig = e.type === 'in' || e.type === 'out' || e.type === 'transfer' || e.type === 'count';
+      e.type === 'in-rev' || e.type === 'out-rev' || e.type === 'transfer-rev' ||
+      e.type === 'count-rev' || e.type === 'receive-rev';
+    const isOrig =
+      e.type === 'in' || e.type === 'out' || e.type === 'transfer' ||
+      e.type === 'count' || e.type === 'receive';
     if (!isRev && !isOrig) throw bad('流水类型非法');
     if (typeof e.product !== 'string' || e.product.trim() === '') throw bad('流水缺少商品编号');
     if (typeof e.wh !== 'string' || e.wh.trim() === '') throw bad('流水缺少仓库标识');
@@ -177,8 +199,8 @@ function validateStore(data: unknown): Store {
       if (e.diff !== e.actual - e.expected) throw bad('盘点流水差额与账面、实盘量不一致');
       const applied = e.type === 'count' ? e.diff : -e.diff; // 冲销盘点应用反向差额
       if (e.after - e.before !== applied) throw bad('盘点流水差额与前后余量不一致');
-      if (e.qty !== undefined || e.from !== undefined || e.to !== undefined)
-        throw bad('盘点流水不应携带数量或调拨字段');
+      if (e.qty !== undefined || e.from !== undefined || e.to !== undefined || e.po !== undefined)
+        throw bad('盘点流水不应携带数量、调拨或采购字段');
     } else {
       if (!isPosSafeInt(e.qty)) throw bad('流水数量非法');
       if (e.expected !== undefined || e.actual !== undefined || e.diff !== undefined)
@@ -191,8 +213,13 @@ function validateStore(data: unknown): Store {
         const expect = (e.wh === e.to) === (e.type === 'transfer') ? e.qty : -e.qty;
         if (delta !== expect) throw bad('流水差额与前后余量不一致');
       } else {
-        const increases = e.type === 'in' || e.type === 'out-rev';
+        const increases = e.type === 'in' || e.type === 'out-rev' || e.type === 'receive';
         if (delta !== (increases ? e.qty : -e.qty)) throw bad('流水差额与前后余量不一致');
+      }
+      if (e.type === 'receive' || e.type === 'receive-rev') {
+        if (typeof e.po !== 'string' || e.po.trim() === '') throw bad('到货流水缺少采购单编号');
+      } else if (e.po !== undefined) {
+        throw bad('非到货流水不应携带采购单字段');
       }
     }
     if (isRev) {
@@ -203,6 +230,35 @@ function validateStore(data: unknown): Store {
     store.entries.push(e as unknown as LedgerEntry);
   }
 
+  // pos 为新增字段：合法旧数据没有该字段，按空集合处理
+  if (data.pos !== undefined) {
+    if (!isPlainObject(data.pos)) throw bad('pos 不是对象');
+    for (const [poId, rec] of Object.entries(data.pos)) {
+      if (typeof poId !== 'string' || poId.trim() === '') throw bad('存在非法采购单编号');
+      if (!isPlainObject(rec)) throw bad(`采购单 ${poId} 的记录非法`);
+      if (typeof rec.supplier !== 'string' || rec.supplier.trim() === '')
+        throw bad(`采购单 ${poId} 的供应商名称非法`);
+      if (typeof rec.wh !== 'string' || rec.wh.trim() === '') throw bad(`采购单 ${poId} 的收货仓非法`);
+      if (!isPlainObject(rec.items) || Object.keys(rec.items).length === 0)
+        throw bad(`采购单 ${poId} 的订购明细非法`);
+      const items = nullProto<Record<string, number>>();
+      for (const [pid, q] of Object.entries(rec.items)) {
+        if (pid.trim() === '' || !isPosSafeInt(q)) throw bad(`采购单 ${poId} 的订购明细非法`);
+        items[pid] = q;
+      }
+      if (!isPlainObject(rec.received)) throw bad(`采购单 ${poId} 的到货进度非法`);
+      const received = nullProto<Record<string, number>>();
+      for (const [pid, q] of Object.entries(rec.received)) {
+        if (items[pid] === undefined || !isNonNegSafeInt(q) || q > items[pid])
+          throw bad(`采购单 ${poId} 的到货进度非法`);
+        received[pid] = q;
+      }
+      if (!Array.isArray(rec.resultLines) || !rec.resultLines.every((l) => typeof l === 'string'))
+        throw bad(`采购单 ${poId} 的结果记录非法`);
+      store.pos[poId] = { supplier: rec.supplier, wh: rec.wh, items, received, resultLines: rec.resultLines };
+    }
+  }
+
   if (!isPlainObject(data.docs)) throw bad('docs 不是对象');
   for (const [docId, rec] of Object.entries(data.docs)) {
     if (typeof docId !== 'string' || docId.trim() === '') throw bad('存在非法单据编号');
@@ -210,7 +266,7 @@ function validateStore(data: unknown): Store {
       throw bad(`单据 ${docId} 的去重记录非法`);
     if (!rec.resultLines.every((l) => typeof l === 'string')) throw bad(`单据 ${docId} 的结果记录非法`);
     const c = rec.content;
-    if (c.type !== 'in' && c.type !== 'out' && c.type !== 'transfer' && c.type !== 'count')
+    if (c.type !== 'in' && c.type !== 'out' && c.type !== 'transfer' && c.type !== 'count' && c.type !== 'receive')
       throw bad(`单据 ${docId} 的业务类型非法`);
     if (!isPlainObject(c.items)) throw bad(`单据 ${docId} 的明细非法`);
     for (const [pid, item] of Object.entries(c.items)) {
@@ -227,6 +283,18 @@ function validateStore(data: unknown): Store {
         throw bad(`单据 ${docId} 的调拨仓非法`);
     } else if (typeof c.wh !== 'string' || c.wh.trim() === '') {
       throw bad(`单据 ${docId} 的仓库非法`);
+    }
+    if (c.type === 'receive') {
+      if (typeof c.po !== 'string' || c.po.trim() === '') throw bad(`到货单 ${docId} 的采购单编号非法`);
+      const po = store.pos[c.po];
+      if (po === undefined) throw bad(`到货单 ${docId} 指向的采购单 ${c.po} 不存在`);
+      if (c.wh !== po.wh) throw bad(`到货单 ${docId} 的收货仓与采购单 ${c.po} 不一致`);
+      for (const [pid, q] of Object.entries(c.items as Record<string, number>)) {
+        if (po.items[pid] === undefined || (q as number) > po.items[pid])
+          throw bad(`到货单 ${docId} 的明细超出采购单 ${c.po} 的订购范围`);
+      }
+    } else if (c.po !== undefined) {
+      throw bad(`单据 ${docId} 不应携带采购单字段`);
     }
     store.docs[docId] = rec as unknown as DocRecord;
   }
@@ -253,9 +321,32 @@ function validateStore(data: unknown): Store {
     }
     // 冲销流水必须能找到所属冲销单
     for (const e of store.entries) {
-      if ((e.type === 'in-rev' || e.type === 'out-rev' || e.type === 'transfer-rev' || e.type === 'count-rev') &&
+      if ((e.type === 'in-rev' || e.type === 'out-rev' || e.type === 'transfer-rev' ||
+           e.type === 'count-rev' || e.type === 'receive-rev') &&
           store.reversals[e.doc] === undefined)
         throw bad(`流水引用了不存在的冲销单 ${e.doc}`);
+    }
+  }
+
+  // 到货进度一致性：采购单有效到货量必须等于未冲销到货单的合计
+  {
+    const reversed = nullProto<Record<string, boolean>>();
+    for (const rec of Object.values(store.reversals)) reversed[rec.orig] = true;
+    const effective = nullProto<Record<string, Record<string, number>>>();
+    for (const [docId, rec] of Object.entries(store.docs)) {
+      const c = rec.content;
+      if (c.type !== 'receive' || reversed[docId]) continue;
+      const m = (effective[c.po as string] ??= nullProto<Record<string, number>>());
+      for (const [pid, q] of Object.entries(c.items as Record<string, number>))
+        m[pid] = (m[pid] ?? 0) + q;
+    }
+    for (const [poId, po] of Object.entries(store.pos)) {
+      for (const pid of Object.keys(po.items)) {
+        const expect = effective[poId]?.[pid] ?? 0;
+        const actual = po.received[pid] ?? 0;
+        if (expect !== actual)
+          throw bad(`采购单 ${poId} 商品 ${pid} 的到货进度（${actual}）与未冲销到货单合计（${expect}）不一致`);
+      }
     }
   }
 
@@ -405,11 +496,60 @@ function parseCountArgs(tokens: string[]): CountRequest {
   return { docId: trimOrThrow('单据编号', docId), wh: trimOrThrow('仓库标识', args.flags['--wh']), items };
 }
 
+interface PoRequest {
+  docId: string; // 采购单编号（独立编号空间）
+  supplier: string;
+  wh: string; // 收货仓
+  items: Map<string, number>; // 商品 -> 订购量（同商品已合并）
+}
+
+interface ReceiveRequest {
+  docId: string; // 到货单编号（与库存单据、冲销单共用编号空间）
+  po: string; // 采购单编号
+  items: Map<string, number>; // 商品 -> 本次到货量（同商品已合并）
+}
+
+function parsePoArgs(tokens: string[]): PoRequest {
+  const args = parseArgs(tokens, ['--supplier', '--wh'], ['--item']);
+  const docId = args.positionals[0];
+  if (docId === undefined || args.positionals.length !== 1)
+    throw new UsageError('用法：po add <采购单编号> --supplier <供应商名称> --wh <收货仓> --item <商品编号:数量> [...]');
+  if (args.flags['--supplier'] === undefined) throw new UsageError('采购单必须提供 --supplier <供应商名称>');
+  if (args.flags['--wh'] === undefined) throw new UsageError('采购单必须提供 --wh <收货仓>');
+  const items = new Map<string, number>();
+  for (const raw of args.multi['--item'] ?? []) parseItem(raw, items);
+  if (items.size === 0) throw new UsageError('采购单至少需要一条 --item 商品编号:数量 明细');
+  return {
+    docId: trimOrThrow('采购单编号', docId),
+    supplier: trimOrThrow('供应商名称', args.flags['--supplier']),
+    wh: trimOrThrow('收货仓标识', args.flags['--wh']),
+    items,
+  };
+}
+
+function parseReceiveArgs(tokens: string[]): ReceiveRequest {
+  const args = parseArgs(tokens, ['--po'], ['--item']);
+  const docId = args.positionals[0];
+  if (docId === undefined || args.positionals.length !== 1)
+    throw new UsageError('用法：receive <到货单编号> --po <采购单编号> --item <商品编号:数量> [...]');
+  if (args.flags['--po'] === undefined) throw new UsageError('到货单必须提供 --po <采购单编号>');
+  const items = new Map<string, number>();
+  for (const raw of args.multi['--item'] ?? []) parseItem(raw, items);
+  if (items.size === 0) throw new UsageError('到货单至少需要一条 --item 商品编号:数量 明细');
+  return {
+    docId: trimOrThrow('到货单编号', docId),
+    po: trimOrThrow('采购单编号', args.flags['--po']),
+    items,
+  };
+}
+
 // ---------- 整批导入文件解析 ----------
 
 type ImportRequest =
   | { kind: 'doc'; req: DocRequest }
   | { kind: 'count'; req: CountRequest }
+  | { kind: 'po'; req: PoRequest }
+  | { kind: 'receive'; req: ReceiveRequest }
   | { kind: 'reverse'; docId: string; orig: string };
 
 /** 读取导入文件：无法读取属于读写失败（退出 1），不改变任何已提交状态。 */
@@ -529,6 +669,21 @@ function parseImportFile(raw: string): ImportRequest[] {
         out.push({ kind: 'count', req: { docId, wh, items: parseCountItems(item, i) } });
         break;
       }
+      case 'po': {
+        checkUnknown(item, ['type', 'id', 'supplier', 'wh', 'items'], i);
+        const docId = requireString(item, 'id', '采购单编号', i);
+        const supplier = requireString(item, 'supplier', '供应商名称', i);
+        const wh = requireString(item, 'wh', '收货仓标识', i);
+        out.push({ kind: 'po', req: { docId, supplier, wh, items: parseQtyItems(item, i) } });
+        break;
+      }
+      case 'receive': {
+        checkUnknown(item, ['type', 'id', 'po', 'items'], i);
+        const docId = requireString(item, 'id', '到货单编号', i);
+        const po = requireString(item, 'po', '采购单编号', i);
+        out.push({ kind: 'receive', req: { docId, po, items: parseQtyItems(item, i) } });
+        break;
+      }
       case 'reverse': {
         checkUnknown(item, ['type', 'id', 'orig'], i);
         const docId = requireString(item, 'id', '冲销单编号', i);
@@ -537,7 +692,7 @@ function parseImportFile(raw: string): ImportRequest[] {
         break;
       }
       default:
-        throw at(i, `不支持的业务类型 "${String(item.type)}"，只允许 in、out、transfer、count、reverse`);
+        throw at(i, `不支持的业务类型 "${String(item.type)}"，只允许 in、out、transfer、count、po、receive、reverse`);
     }
   });
 
@@ -591,6 +746,20 @@ function canonicalCountContent(req: CountRequest): Record<string, unknown> {
   return { type: 'count', wh: req.wh, items };
 }
 
+function sortedQtyItems(items: Map<string, number>): Record<string, number> {
+  const out: Record<string, number> = nullProto();
+  for (const pid of [...items.keys()].sort()) out[pid] = items.get(pid)!;
+  return out;
+}
+
+function canonicalPoContent(req: PoRequest): Record<string, unknown> {
+  return { supplier: req.supplier, wh: req.wh, items: sortedQtyItems(req.items) };
+}
+
+function canonicalReceiveContent(req: ReceiveRequest, wh: string): Record<string, unknown> {
+  return { type: 'receive', po: req.po, wh, items: sortedQtyItems(req.items) };
+}
+
 interface ApplyOutcome {
   duplicate: boolean;
   header: string; // 结果首行汇总
@@ -610,9 +779,12 @@ class Ledger {
   private seq: number;
   private readonly docs: Record<string, DocRecord> = nullProto();
   private readonly revs: Record<string, ReversalRecord> = nullProto();
+  private readonly pos: Record<string, PurchaseOrder> = nullProto();
+  private readonly posTouched = new Set<string>(); // 进度或内容发生变动的采购单
   private readonly reversedOrigs = new Set<string>();
   private readonly newDocIds: string[] = [];
   private readonly newRevIds: string[] = [];
+  private readonly newPoIds: string[] = [];
 
   constructor(store: Store) {
     this.base = store;
@@ -623,27 +795,44 @@ class Ledger {
       this.revs[id] = rec;
       this.reversedOrigs.add(rec.orig);
     }
+    // 深拷贝采购单：进度随到货/冲销在草稿上变动，commit 时才写回
+    for (const [id, po] of Object.entries(store.pos)) {
+      const items = nullProto<Record<string, number>>();
+      for (const k of Object.keys(po.items)) items[k] = po.items[k];
+      const received = nullProto<Record<string, number>>();
+      for (const k of Object.keys(po.received)) received[k] = po.received[k];
+      this.pos[id] = { supplier: po.supplier, wh: po.wh, items, received, resultLines: [...po.resultLines] };
+    }
   }
 
   /** 是否有新生效单据：无新单据（全部重复）时 commit 不改写数据。 */
   get changed(): boolean {
-    return this.newDocIds.length + this.newRevIds.length > 0;
+    return this.newDocIds.length + this.newRevIds.length + this.newPoIds.length > 0;
   }
 
   /** 重建原始单据结果首行，供幂等重放。 */
   private docHeader(docId: string, rec: DocRecord): string {
     const c = rec.content;
     const n = Object.keys(c.items as Record<string, unknown>).length;
-    return c.type === 'count'
-      ? `盘点单 ${docId} 提交成功，仓库 ${c.wh as string}，共 ${n} 种商品：`
-      : `${c.type === 'in' ? '入库' : c.type === 'out' ? '出库' : '调拨'}单 ${docId} 提交成功，共 ${n} 种商品：`;
+    if (c.type === 'count')
+      return `盘点单 ${docId} 提交成功，仓库 ${c.wh as string}，共 ${n} 种商品：`;
+    if (c.type === 'receive')
+      return `到货单 ${docId} 提交成功，采购单 ${c.po as string}，收货仓 ${c.wh as string}，共 ${n} 种商品：`;
+    return `${c.type === 'in' ? '入库' : c.type === 'out' ? '出库' : '调拨'}单 ${docId} 提交成功，共 ${n} 种商品：`;
+  }
+
+  /** 重建采购单登记结果首行，供幂等重放。 */
+  private poHeader(poId: string, po: PurchaseOrder): string {
+    return `采购单 ${poId} 登记成功，供应商 ${po.supplier}，收货仓 ${po.wh}，共 ${Object.keys(po.items).length} 种商品：`;
   }
 
   /** 重建冲销单结果首行，供幂等重放。 */
   private revHeader(revId: string, rec: ReversalRecord): string {
     const origRec = this.docs[rec.orig]; // 能进入去重视图的冲销单必然指向存在的原单
     const type = origRec.content.type as string;
-    const label = type === 'in' ? '入库' : type === 'out' ? '出库' : type === 'transfer' ? '调拨' : '盘点';
+    const label =
+      type === 'in' ? '入库' : type === 'out' ? '出库' : type === 'transfer' ? '调拨'
+      : type === 'receive' ? '到货' : '盘点';
     const n = Object.keys(origRec.content.items as Record<string, unknown>).length;
     return `冲销单 ${revId} 提交成功，冲销${label}原单 ${rec.orig}，共 ${n} 种商品：`;
   }
@@ -789,6 +978,113 @@ class Ledger {
   }
 
   /**
+   * 采购单登记：独立编号空间（与库存单据、冲销单可同名），登记不改库存，
+   * 成功后不可修改。同编号同内容（供应商、收货仓、合并后订购量，明细顺序无关）
+   * 重放只返回原登记结果，不重置进度；同编号不同内容拒绝。
+   */
+  applyPo(req: PoRequest): ApplyOutcome {
+    const content = canonicalPoContent(req);
+    const existed = this.pos[req.docId];
+    if (existed !== undefined) {
+      const existedContent = { supplier: existed.supplier, wh: existed.wh, items: existed.items };
+      if (stableStringify(existedContent) !== stableStringify(content))
+        throw new BizError(`采购单编号 ${req.docId} 已登记且内容不同，采购单成功后不可修改，拒绝提交`);
+      return {
+        duplicate: true,
+        header: this.poHeader(req.docId, existed),
+        lines: existed.resultLines,
+        repeatedFrom: this.base.pos[req.docId] !== undefined ? 'store' : 'batch',
+      };
+    }
+    for (const pid of req.items.keys()) {
+      if (this.base.products[pid] === undefined) throw new BizError(`商品未登记，拒绝登记采购单：${pid}`);
+    }
+
+    const reportLines: string[] = [];
+    for (const pid of [...req.items.keys()].sort()) {
+      reportLines.push(`订购 ${pid}：${req.items.get(pid)!}`);
+    }
+    this.pos[req.docId] = {
+      supplier: req.supplier,
+      wh: req.wh,
+      items: content.items as Record<string, number>,
+      received: nullProto<Record<string, number>>(),
+      resultLines: reportLines,
+    };
+    this.newPoIds.push(req.docId);
+    this.posTouched.add(req.docId);
+
+    return { duplicate: false, header: this.poHeader(req.docId, this.pos[req.docId]), lines: reportLines };
+  }
+
+  /**
+   * 到货：按采购单收货仓分批入库。仅收单内商品，各商品未冲销累计到货不得超过
+   * 订购量；任一明细非法、超收或库存溢出整单拒绝。成功同时更新库存与采购进度。
+   * 到货单与库存单据、冲销单共用编号空间：同号同采购同合并数量重放只返回原结果，
+   * 即使已收齐、库存变化或已冲销也不再生效；同号不同内容或其他业务拒绝。
+   */
+  applyReceive(req: ReceiveRequest): ApplyOutcome {
+    const existed = this.docs[req.docId];
+    if (existed !== undefined) {
+      const po = this.pos[req.po];
+      if (po === undefined) throw new BizError(`采购单 ${req.po} 不存在，拒绝到货`);
+      const content = canonicalReceiveContent(req, po.wh);
+      if (stableStringify(existed.content) !== stableStringify(content))
+        throw new BizError(`单据编号 ${req.docId} 已用于业务内容不同的单据，拒绝提交`);
+      return { duplicate: true, header: this.docHeader(req.docId, existed), lines: existed.resultLines, repeatedFrom: this.repeatedDocSource(req.docId) };
+    }
+    // 编号空间与入库/出库/调拨/盘点/冲销单共用
+    if (this.revs[req.docId] !== undefined)
+      throw new BizError(`单据编号 ${req.docId} 已用于冲销单，拒绝提交`);
+
+    const po = this.pos[req.po];
+    if (po === undefined) throw new BizError(`采购单 ${req.po} 不存在，拒绝到货`);
+    const content = canonicalReceiveContent(req, po.wh);
+    const pids = [...req.items.keys()].sort();
+
+    // 先整单校验：仅收单内商品，未冲销累计到货不得超过订购量
+    for (const pid of pids) {
+      const ordered = po.items[pid];
+      if (ordered === undefined)
+        throw new BizError(`商品 ${pid} 不在采购单 ${req.po} 的订购明细中，拒绝整单`);
+      const qty = req.items.get(pid)!;
+      const received = po.received[pid] ?? 0;
+      if (received + qty > ordered)
+        throw new BizError(
+          `商品 ${pid} 到货超出订购量（订购 ${ordered}，有效到货 ${received}，本次 ${qty}），拒绝整单`,
+        );
+    }
+
+    const reportLines: string[] = [];
+    for (const pid of pids) {
+      const qty = req.items.get(pid)!;
+      const before = getStock(this.draft, pid, po.wh);
+      const after = before + qty;
+      if (after > MAX_SAFE) throw new BizError(`商品 ${pid} 到货后余量超出安全整数范围，拒绝整单`);
+      setStock(this.draft, pid, po.wh, after);
+      const total = (po.received[pid] ?? 0) + qty;
+      po.received[pid] = total;
+      this.additions.push({
+        seq: ++this.seq, doc: req.docId, type: 'receive', product: pid, wh: po.wh,
+        qty, before, after, po: req.po,
+      });
+      reportLines.push(
+        `到货 ${pid} @${po.wh} +${qty}：${before} -> ${after}；累计到货 ${total}/${po.items[pid]}，待到货 ${po.items[pid] - total}`,
+      );
+    }
+    this.posTouched.add(req.po);
+
+    this.docs[req.docId] = { content, resultLines: reportLines };
+    this.newDocIds.push(req.docId);
+
+    return {
+      duplicate: false,
+      header: `到货单 ${req.docId} 提交成功，采购单 ${req.po}，收货仓 ${po.wh}，共 ${pids.length} 种商品：`,
+      lines: reportLines,
+    };
+  }
+
+  /**
    * 整单冲销：在“当前余量”上应用原单的相反变动（不回滚历史、不恢复绝对余量）。
    * 原单可以是导入前已成功的单据，也可以是本批此前已模拟生效的新原单；
    * 冲销单不可冲销，每张原单最多冲销一次。
@@ -826,14 +1122,42 @@ class Ledger {
     }
 
     const c = origRec.content;
-    const type = c.type as DocType | 'count';
+    const type = c.type as DocType | 'count' | 'receive';
     const items = c.items as Record<string, number>;
     const pids = Object.keys(items).sort();
-    const typeLabel = type === 'in' ? '入库' : type === 'out' ? '出库' : type === 'transfer' ? '调拨' : '盘点';
+    const typeLabel =
+      type === 'in' ? '入库' : type === 'out' ? '出库' : type === 'transfer' ? '调拨'
+      : type === 'receive' ? '到货' : '盘点';
     const revType = `${type}-rev` as EntryType;
     const reportLines: string[] = [];
 
     for (const pid of pids) {
+      if (type === 'receive') {
+        // 冲销到货：从当前收货仓扣回原数量，并减少采购单有效到货量（收齐的可重新待收）
+        const wh = c.wh as string;
+        const poId = c.po as string;
+        const po = this.pos[poId]; // 到货单指向的采购单必然存在
+        const qty = items[pid];
+        const before = getStock(this.draft, pid, wh);
+        if (before < qty)
+          throw new BizError(
+            `冲销到货原单 ${origId}：商品 ${pid} 仓库 ${wh} 当前余量 ${before} 不足扣回 ${qty}，拒绝整单`,
+          );
+        const after = before - qty;
+        setStock(this.draft, pid, wh, after);
+        const total = (po.received[pid] ?? 0) - qty;
+        po.received[pid] = total;
+        this.posTouched.add(poId);
+        this.additions.push({
+          seq: ++this.seq, doc: revId, type: revType, product: pid, wh,
+          qty, before, after, orig: origId, po: poId,
+        });
+        reportLines.push(
+          `冲销到货 原单=${origId} 商品=${pid} @${wh} -${qty}：${before} -> ${after}；` +
+            `累计到货 ${total}/${po.items[pid]}，待到货 ${po.items[pid] - total}`,
+        );
+        continue;
+      }
       if (type === 'count') {
         // 冲销盘点：在当前余量上减去原盘点差额（不恢复原账面绝对值）；零差额不改余量但须记录
         const wh = c.wh as string;
@@ -935,8 +1259,8 @@ class Ledger {
   }
 
   /**
-   * 统一提交：把草稿余量、新增流水、新单据去重记录与冲销关系写回 base 并原子保存。
-   * 全部项均为重复时不写回、不保存（不改写数据）。
+   * 统一提交：把草稿余量、新增流水、新单据去重记录、冲销关系与采购单（含进度）
+   * 写回 base 并原子保存。全部项均为重复时不写回、不保存（不改写数据）。
    */
   commit(dataDir: string): void {
     if (!this.changed) return;
@@ -944,6 +1268,7 @@ class Ledger {
     this.base.entries.push(...this.additions);
     for (const id of this.newDocIds) this.base.docs[id] = this.docs[id];
     for (const id of this.newRevIds) this.base.reversals[id] = this.revs[id];
+    for (const id of this.posTouched) this.base.pos[id] = this.pos[id];
     saveStore(dataDir, this.base);
   }
 }
@@ -981,6 +1306,78 @@ function runProduct(rest: string[], dataDir: string, store: Store): void {
   }
 }
 
+function poStatus(po: PurchaseOrder): string {
+  let allZero = true;
+  let allFull = true;
+  for (const pid of Object.keys(po.items)) {
+    const r = po.received[pid] ?? 0;
+    if (r !== 0) allZero = false;
+    if (r !== po.items[pid]) allFull = false;
+  }
+  return allFull ? '收齐' : allZero ? '未到货' : '部分到货';
+}
+
+function showPo(store: Store, poId: string): void {
+  const po = store.pos[poId];
+  if (po === undefined) throw new BizError(`采购单 ${poId} 不存在`);
+  console.log(`采购单 ${poId}：供应商 ${po.supplier}，收货仓 ${po.wh}，状态 ${poStatus(po)}`);
+  console.log('商品\t订购\t有效到货\t待到货');
+  for (const pid of Object.keys(po.items).sort()) {
+    const r = po.received[pid] ?? 0;
+    console.log(`${pid}\t${po.items[pid]}\t${r}\t${po.items[pid] - r}`);
+  }
+  // 到货与冲销关联：列出本采购单的全部到货单及其冲销状态
+  const receipts: string[] = [];
+  for (const [docId, rec] of Object.entries(store.docs)) {
+    const c = rec.content;
+    if (c.type !== 'receive' || c.po !== poId) continue;
+    let revId: string | undefined;
+    for (const [rid, rrec] of Object.entries(store.reversals)) {
+      if (rrec.orig === docId) revId = rid;
+    }
+    receipts.push(revId === undefined ? `${docId}（有效）` : `${docId}（已由冲销单 ${revId} 冲销）`);
+  }
+  receipts.sort();
+  console.log(receipts.length === 0 ? '关联到货单：（暂无到货）' : `关联到货单：${receipts.join('、')}`);
+}
+
+function runPo(rest: string[], dataDir: string, store: Store): void {
+  const sub = rest[0];
+  const tokens = rest.slice(1);
+  if (sub === 'add') {
+    const req = parsePoArgs(tokens);
+    const ledger = new Ledger(store);
+    const outcome = ledger.applyPo(req);
+    ledger.commit(dataDir);
+    if (outcome.duplicate) {
+      console.log(`采购单 ${req.docId} 为重复登记，内容与原登记一致，返回原登记结果（订购内容与进度不变）：`);
+    } else {
+      console.log(outcome.header);
+    }
+    for (const line of outcome.lines) console.log(line);
+  } else if (sub === 'show') {
+    const args = parseArgs(tokens, []);
+    if (args.positionals.length !== 1) throw new UsageError('用法：po show <采购单编号>');
+    showPo(store, trimOrThrow('采购单编号', args.positionals[0]));
+  } else if (sub === 'list' || sub === 'ls') {
+    const args = parseArgs(tokens, []);
+    if (args.positionals.length > 0) throw new UsageError('用法：po list');
+    const ids = Object.keys(store.pos).sort();
+    console.log(`已登记采购单（${ids.length}）：`);
+    if (ids.length === 0) {
+      console.log('（暂无已登记采购单）');
+    } else {
+      console.log('编号\t供应商\t收货仓\t状态');
+      for (const id of ids) {
+        const po = store.pos[id];
+        console.log(`${id}\t${po.supplier}\t${po.wh}\t${poStatus(po)}`);
+      }
+    }
+  } else {
+    throw new UsageError(sub === undefined ? '用法：po <add|show|list> …' : `未知 po 子命令：${sub}`);
+  }
+}
+
 function runBalance(rest: string[], store: Store): void {
   const args = parseArgs(rest, ['--wh']);
   const [pidRaw, ...extra] = args.positionals;
@@ -1014,10 +1411,12 @@ const TYPE_LABEL: Record<EntryType, string> = {
   out: '出库',
   transfer: '调拨',
   count: '盘点',
+  receive: '到货',
   'in-rev': '冲销入库',
   'out-rev': '冲销出库',
   'transfer-rev': '冲销调拨',
   'count-rev': '冲销盘点',
+  'receive-rev': '冲销到货',
 };
 
 function formatEntry(e: LedgerEntry): string {
@@ -1029,33 +1428,44 @@ function formatEntry(e: LedgerEntry): string {
       `\t差额=${fmtSigned(applied)}\t${e.before}->${e.after}\t账面=${e.expected}\t实盘=${e.actual}`;
   } else {
     let signed: string;
-    // 符号必须与前后余量一致：入库/冲销出库/调入方向为增，其余为减
+    // 符号必须与前后余量一致：入库/到货/冲销出库/调入方向为增，其余为减
     const increases =
-      e.type === 'in' || e.type === 'out-rev' ||
+      e.type === 'in' || e.type === 'out-rev' || e.type === 'receive' ||
       ((e.type === 'transfer' || e.type === 'transfer-rev') &&
         (e.type === 'transfer') === (e.wh === e.to));
     signed = `${increases ? '+' : '-'}${e.qty}`;
     line = `#${e.seq}\t单据=${e.doc}\t${TYPE_LABEL[e.type]}\t商品=${e.product}\t仓库=${e.wh}\t${signed}\t${e.before}->${e.after}`;
     if (e.type === 'transfer' || e.type === 'transfer-rev') line += `\t调拨=${e.from}->${e.to}`;
+    if (e.po !== undefined) line += `\t采购单=${e.po}`;
   }
   if (e.orig !== undefined) line += `\t原单=${e.orig}`;
   return line;
 }
 
 function runFlow(rest: string[], store: Store): void {
-  const args = parseArgs(rest, ['--product', '--wh']);
-  if (args.positionals.length > 0) throw new UsageError('用法：flow (--product <商品编号> | --wh <仓库>)…');
+  const args = parseArgs(rest, ['--product', '--wh', '--po']);
+  if (args.positionals.length > 0)
+    throw new UsageError('用法：flow (--product <商品编号> | --wh <仓库> | --po <采购单编号>)…');
   const product = args.flags['--product'];
   const wh = args.flags['--wh'];
-  if (product === undefined && wh === undefined)
-    throw new UsageError('flow 至少需要一个过滤条件：--product <商品编号> 和/或 --wh <仓库>');
+  const po = args.flags['--po'];
+  if (product === undefined && wh === undefined && po === undefined)
+    throw new UsageError('flow 至少需要一个过滤条件：--product <商品编号>、--wh <仓库> 和/或 --po <采购单编号>');
   const pid = product === undefined ? undefined : trimOrThrow('商品编号', product);
   const wid = wh === undefined ? undefined : trimOrThrow('仓库标识', wh);
+  const poid = po === undefined ? undefined : trimOrThrow('采购单编号', po);
 
   const rows = store.entries.filter(
-    (e) => (pid === undefined || e.product === pid) && (wid === undefined || e.wh === wid),
+    (e) =>
+      (pid === undefined || e.product === pid) &&
+      (wid === undefined || e.wh === wid) &&
+      (poid === undefined || e.po === poid),
   );
-  const scope = [pid !== undefined ? `商品=${pid}` : null, wid !== undefined ? `仓库=${wid}` : null]
+  const scope = [
+    pid !== undefined ? `商品=${pid}` : null,
+    wid !== undefined ? `仓库=${wid}` : null,
+    poid !== undefined ? `采购单=${poid}` : null,
+  ]
     .filter(Boolean)
     .join(' ');
   console.log(`流水（${scope}），共 ${rows.length} 条，按提交顺序（冲销流水标注原单编号）：`);
@@ -1122,6 +1532,8 @@ function runImport(rest: string[], dataDir: string): void {
     const apply = (): ApplyOutcome => {
       if (r.kind === 'doc') return ledger.applyDoc(r.req);
       if (r.kind === 'count') return ledger.applyCount(r.req);
+      if (r.kind === 'po') return ledger.applyPo(r.req);
+      if (r.kind === 'receive') return ledger.applyReceive(r.req);
       return ledger.applyReversal(r.docId, r.orig);
     };
     let outcome: ApplyOutcome;
@@ -1170,18 +1582,38 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
            --item <编号:数量> [...]                        跨仓调拨（两仓不能相同）
   count <单据编号> --wh <仓库> \\
         --item <编号:预期账面量:实盘量> [...]              整单盘点校正（先核对账面再按实盘校正）
-  reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点单
+  po add <采购编号> --supplier <供应商> --wh <收货仓> \\
+         --item <编号:数量> [...]                          登记采购单（不改库存，成功后不可修改）
+  po show <采购编号>                          查询采购单：供应商、收货仓、订购/有效到货/待到货与状态
+  po list                                   列出全部采购单及到货状态
+  receive <到货单编号> --po <采购编号> \\
+          --item <编号:数量> [...]                         采购到货（分批入收货仓，超收整单拒绝）
+  reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点/到货单
   import --file <单据列表.json>              整批导入有序单据列表（按顺序生效，整批成败一致）
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
-  flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
-       | --wh <仓库> [--product <编号>]
+  flow (--product <编号> | --wh <仓库> | --po <采购编号>)…   按商品/仓库/采购单查询流水
   -h, --help                                显示本帮助
 
 规则：
   数量必须为正安全整数；同单同商品的重复明细先合并，再做足量与溢出校验；
-  任一明细不合法则整单拒绝。单据编号（含冲销单）在同一数据目录内共用全局唯一
-  编号空间，相同内容重复提交返回原结果且不重复变动，同编号不同内容拒绝；失败
-  提交不占用编号。
+  任一明细不合法则整单拒绝。库存单据与到货单编号（含冲销单）在同一数据目录
+  内共用全局唯一编号空间，采购单编号独立；相同内容重复提交返回原结果且不重复
+  变动，同编号不同内容拒绝；失败提交不占用编号。
+
+采购与到货规则：
+  采购单含编号、供应商名称、收货仓与已登记商品的订购量（至少一项，正安全整数，
+  同商品先合并再查溢出）。登记不改库存，成功后不可修改；采购编号独立于库存单
+  据编号空间，可同名。同号同内容（明细顺序无关）重放返回原登记结果、不重置进
+  度，同号不同内容拒绝。
+  到货单有独立单号，与库存单据、冲销单共用编号空间；按采购单收货仓分批入库，
+  仅收单内商品，各商品未冲销累计到货不得超过订购量，其他库存业务不改采购进
+  度。任一明细非法、超收或库存溢出整单拒绝；成功同时更新库存与进度，输出本
+  次数量、库存前后量、累计及待到货量。同号同采购同合并数量重放返回原结果，
+  收齐、库存变化或已冲销后重放也不生效；同号不同内容或其他业务拒绝，普通入
+  库不可事后绑定采购；失败不占编号。
+  冲销到货：reverse 可整单冲销到货单，从当前收货仓扣回原数量并减少有效到货
+  量，收齐采购重新待收，不撤销后续业务；任一商品不足整单拒绝，不改进度或冲
+  销关系，同号可重试。每张到货最多冲销一次。
 
 盘点规则：
   盘点单逐项给出某仓库中已登记商品的预期账面量与实盘量（均为非负安全整数），
@@ -1195,9 +1627,10 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   冲销在“当前余量”上应用原单的相反变动，不回滚原单之后的其他业务、不恢复绝对
   余量：冲销入库从原目标仓扣回；冲销出库向原来源仓补回；冲销调拨从原调入仓扣
   回并向原调出仓补回；冲销盘点在当前余量上减去原盘点差额（零差额不改余量，
-  但仍记录冲销关系与流水）。数量取原单合并后的明细。任一商品扣回不足、补回后
-  溢出或冲减后为负则整单拒绝、不占用冲销单编号、原单不标记冲销，条件改善后
-  可重试。
+  但仍记录冲销关系与流水）；冲销到货从当前收货仓扣回原数量并减少采购单有效
+  到货量（收齐的采购单重新待收）。数量取原单合并后的明细。任一商品扣回不足、
+  补回后溢出或冲减后为负则整单拒绝、不占用冲销单编号、原单不标记冲销，条件
+  改善后可重试。
   只能冲销成功的原始单据；原单不存在、冲销单本身、已冲销过的原单均不能再次冲
   销，每张原单最多冲销一次。冲销成功后重放原单仍只返回其最初结果，不会重新生
   效；重放冲销单返回原冲销结果，不再变动，同编号改指其他原单则拒绝。
@@ -1212,17 +1645,22 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
     出库 {"type":"out","id":"D2","wh":"W1","items":[{"product":"P1","qty":4}]}
     调拨 {"type":"transfer","id":"D3","from":"W1","to":"W2","items":[{"product":"P1","qty":2}]}
     盘点 {"type":"count","id":"C1","wh":"W1","items":[{"product":"P1","expected":8,"actual":5}]}
+    采购 {"type":"po","id":"PO1","supplier":"S1","wh":"W1","items":[{"product":"P1","qty":10}]}
+    到货 {"type":"receive","id":"RC1","po":"PO1","items":[{"product":"P1","qty":4}]}
     冲销 {"type":"reverse","id":"R1","orig":"D1"}
-  入出库及调拨 qty 为正安全整数，同商品明细先合并再校验；盘点 expected/actual
-  均为非负安全整数，同商品重复拒绝。单据编号与单条命令共用唯一空间，不产生批
-  次编号：导入前已有或本列表此前出现的“同编号同内容”项只返回原结果，不重新核
+  入出库、调拨、采购及到货 qty 为正安全整数，同商品明细先合并再校验；盘点
+  expected/actual 均为非负安全整数，同商品重复拒绝。采购单登记不改库存、
+  不可修改；到货按采购单收货仓入库并更新进度，超收整批拒绝；冲销到货同样
+  更新进度。单据编号与单条命令共用唯一空间（采购编号独立），不产生批次编
+  号：导入前已有或本列表此前出现的“同编号同内容”项只返回原结果，不重新核
   对、不追加流水（即使原单已冲销也不重新生效）；普通单比较类型、仓库及合并后
-  商品数量，盘点比较仓库及两种数量，冲销比较原单编号，明细顺序无关。同编号不
-  同内容或不同业务整批拒绝。
+  商品数量，盘点比较仓库及两种数量，采购比较供应商、收货仓及订购量，到货比
+  较采购编号及合并数量，冲销比较原单编号，明细顺序无关。同编号不同内容或不
+  同业务整批拒绝。
   整批成功须全部项通过，有新生效单据时整批一次性保存；全部重复时不改写数据。
-  任一项格式不合法、缺货、账面冲突、溢出、编号冲突或非法冲销，整批拒绝并指出
-  位置和原因：此前已保存的单据不撤销，本批新库存、流水、编号与冲销关系均不保
-  留，纠正后可复用这些新编号。文件无法读取、数据损坏或保存失败均不改变已提交
+  任一项格式不合法、缺货、超收、账面冲突、溢出、编号冲突或非法冲销，整批拒绝并指出
+  位置和原因：此前已保存的单据不撤销，本批新库存、采购进度、流水、编号与冲销关系均
+  不保留，纠正后可复用这些新编号。文件无法读取、数据损坏或保存失败均不改变已提交
   状态，也不报告部分成功。文件格式或参数错误退出 2，业务拒绝及读写失败退出 1。
 
 示例：
@@ -1231,12 +1669,18 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data out D2 --wh W1 --item P1:4
   node app.ts -d ./data transfer D3 --from W1 --to W2 --item P1:2 --item P1:3
   node app.ts -d ./data count C1 --wh W1 --item P1:1:5 --item P2:3:3
+  node app.ts -d ./data po add PO1 --supplier 华东五金 --wh W1 --item P1:10
+  node app.ts -d ./data receive RC1 --po PO1 --item P1:4
+  node app.ts -d ./data receive RC2 --po PO1 --item P1:6
+  node app.ts -d ./data po show PO1
   node app.ts -d ./data reverse R1 --orig D3
   node app.ts -d ./data reverse R2 --orig C1
+  node app.ts -d ./data reverse R3 --orig RC1
   node app.ts -d ./data import --file ./docs.json
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
   node app.ts -d ./data flow --product P1
+  node app.ts -d ./data flow --po PO1
   node app.ts -d ./data flow --wh W2`;
 
 function printHelp(): void {
@@ -1274,6 +1718,25 @@ function run(argv: string[]): void {
     case 'product': {
       const store = loadStore(dataDir);
       runProduct(tokens, dataDir, store);
+      break;
+    }
+    case 'po': {
+      const store = loadStore(dataDir);
+      runPo(tokens, dataDir, store);
+      break;
+    }
+    case 'receive': {
+      const req = parseReceiveArgs(tokens);
+      const store = loadStore(dataDir);
+      const ledger = new Ledger(store);
+      const outcome = ledger.applyReceive(req);
+      ledger.commit(dataDir);
+      if (outcome.duplicate) {
+        console.log(`到货单 ${req.docId} 为重复提交，业务内容与原提交一致，返回原提交结果（库存、进度与流水不变）：`);
+      } else {
+        console.log(outcome.header);
+      }
+      for (const line of outcome.lines) console.log(line);
       break;
     }
     case 'in':
