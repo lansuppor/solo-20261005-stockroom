@@ -478,22 +478,23 @@ function validateStore(data: unknown): Store {
     }
   }
 
-  // 到货流水必须能找到所属到货单，且逐项数量/采购单/收货仓与记录一致
-  const arrivalEntrySeen = nullProto<Record<string, Record<string, number>>>();
+  // 到货流水必须能找到所属到货单，且逐项数量/采购单/收货仓与记录一致；
+  // 逐商品合计用 BigInt 精确累计，避免多条流水合计超过安全整数范围时舍入误判
+  const arrivalEntrySeen = nullProto<Record<string, Record<string, bigint>>>();
   for (const e of store.entries) {
     if (e.type !== 'arrival') continue;
     const arr = store.arrivals[e.doc];
     if (arr === undefined) throw bad(`流水引用了不存在的到货单 ${e.doc}`);
     if (e.po !== arr.poId) throw bad(`到货单 ${e.doc} 流水的采购单编号与记录不一致`);
     if (e.wh !== arr.wh) throw bad(`到货单 ${e.doc} 流水的收货仓与记录不一致`);
-    const perProduct = (arrivalEntrySeen[e.doc] ??= nullProto<Record<string, number>>());
-    perProduct[e.product] = (perProduct[e.product] ?? 0) + e.qty!;
+    const perProduct = (arrivalEntrySeen[e.doc] ??= nullProto<Record<string, bigint>>());
+    perProduct[e.product] = (perProduct[e.product] ?? 0n) + BigInt(e.qty!);
   }
   for (const [arrId, arr] of Object.entries(store.arrivals)) {
     const seen = arrivalEntrySeen[arrId];
     if (seen === undefined) throw bad(`到货单 ${arrId} 缺少到货流水`);
     for (const [pid, q] of Object.entries(arr.qty)) {
-      if (seen[pid] !== q) throw bad(`到货单 ${arrId} 商品 ${pid} 的流水数量与记录不一致`);
+      if (seen[pid] !== BigInt(q)) throw bad(`到货单 ${arrId} 商品 ${pid} 的流水数量与记录不一致`);
     }
     for (const pid of Object.keys(seen)) {
       if (arr.qty[pid] === undefined) throw bad(`到货单 ${arrId} 的流水含记录中没有的商品 ${pid}`);
@@ -512,8 +513,8 @@ function validateStore(data: unknown): Store {
       throw bad(`冲销单 ${e.doc} 商品 ${e.product} 的冲销量与原到货单不一致`);
   }
 
-  // 退货流水必须能找到所属退货单，且逐项数量/原到货单/采购单/收货仓与记录一致
-  const returnEntrySeen = nullProto<Record<string, Record<string, number>>>();
+  // 退货流水必须能找到所属退货单，且逐项数量/原到货单/采购单/收货仓与记录一致（合计同样精确累计）
+  const returnEntrySeen = nullProto<Record<string, Record<string, bigint>>>();
   for (const e of store.entries) {
     if (e.type !== 'return') continue;
     const ret = store.returns[e.doc];
@@ -521,14 +522,14 @@ function validateStore(data: unknown): Store {
     if (e.arr !== ret.arrId) throw bad(`退货单 ${e.doc} 流水的原到货单编号与记录不一致`);
     if (e.po !== ret.poId) throw bad(`退货单 ${e.doc} 流水的采购单编号与记录不一致`);
     if (e.wh !== ret.wh) throw bad(`退货单 ${e.doc} 流水的收货仓与记录不一致`);
-    const perProduct = (returnEntrySeen[e.doc] ??= nullProto<Record<string, number>>());
-    perProduct[e.product] = (perProduct[e.product] ?? 0) + e.qty!;
+    const perProduct = (returnEntrySeen[e.doc] ??= nullProto<Record<string, bigint>>());
+    perProduct[e.product] = (perProduct[e.product] ?? 0n) + BigInt(e.qty!);
   }
   for (const [retId, ret] of Object.entries(store.returns)) {
     const seen = returnEntrySeen[retId];
     if (seen === undefined) throw bad(`退货单 ${retId} 缺少退货流水`);
     for (const [pid, q] of Object.entries(ret.qty)) {
-      if (seen[pid] !== q) throw bad(`退货单 ${retId} 商品 ${pid} 的流水数量与记录不一致`);
+      if (seen[pid] !== BigInt(q)) throw bad(`退货单 ${retId} 商品 ${pid} 的流水数量与记录不一致`);
     }
     for (const pid of Object.keys(seen)) {
       if (ret.qty[pid] === undefined) throw bad(`退货单 ${retId} 的流水含记录中没有的商品 ${pid}`);
@@ -556,14 +557,14 @@ function validateStore(data: unknown): Store {
     if (Object.values(store.reversals).some((r) => r.orig === ret.arrId))
       throw bad(`到货单 ${ret.arrId} 已整单冲销，但其退货单 ${retId} 未冲销（有未冲销退货的到货单禁止冲销）`);
     const arr = store.arrivals[ret.arrId];
-    const sumByPid = nullProto<Record<string, number>>();
+    const sumByPid = nullProto<Record<string, bigint>>();
     for (const [otherId, other] of Object.entries(store.returns)) {
       if (other.arrId !== ret.arrId) continue;
       if (Object.values(store.reversals).some((r) => r.orig === otherId)) continue;
-      for (const [pid, q] of Object.entries(other.qty)) sumByPid[pid] = (sumByPid[pid] ?? 0) + q;
+      for (const [pid, q] of Object.entries(other.qty)) sumByPid[pid] = (sumByPid[pid] ?? 0n) + BigInt(q);
     }
     for (const [pid, sum] of Object.entries(sumByPid)) {
-      if (sum > arr.qty[pid])
+      if (sum > BigInt(arr.qty[pid]))
         throw bad(`到货单 ${ret.arrId} 商品 ${pid} 未冲销累计退货 ${sum} 超过原到货量 ${arr.qty[pid]}`);
     }
   }
@@ -596,15 +597,16 @@ function validateStore(data: unknown): Store {
   // “有效到货 + 未冲销累计取消”不得超过订购量
   // （待到货量 = 订购量 - 有效到货量 - 有效取消量，不得为负）。
   // 注意：退货释放待到货后允许再次到货，故未冲销到货总量本身可以超过订购量，
-  // 必须先抵减未冲销退货再校验。
+  // 甚至可以超过安全整数范围（反复退货、补收）——必须先抵减未冲销退货再校验，
+  // 且全程用 BigInt 精确累计，不得因中间累计舍入而改变净量或误拒合法数据。
   for (const [poId, po] of Object.entries(store.purchases)) {
-    const arrived = nullProto<Record<string, number>>();
+    const arrived = nullProto<Record<string, bigint>>();
     for (const [arrId, arr] of Object.entries(store.arrivals)) {
       if (arr.poId !== poId) continue;
       const isReversed = Object.values(store.reversals).some((r) => r.orig === arrId);
       if (isReversed) continue; // 已整单冲销的到货不再计入有效到货
       for (const [pid, q] of Object.entries(arr.qty)) {
-        arrived[pid] = (arrived[pid] ?? 0) + q;
+        arrived[pid] = (arrived[pid] ?? 0n) + BigInt(q);
       }
     }
     // 未冲销退货抵减有效到货（前面已保证其原到货单未冲销且不超退）
@@ -613,23 +615,23 @@ function validateStore(data: unknown): Store {
       const isReversed = Object.values(store.reversals).some((r) => r.orig === retId);
       if (isReversed) continue;
       for (const [pid, q] of Object.entries(ret.qty)) {
-        arrived[pid] = (arrived[pid] ?? 0) - q;
-        if (arrived[pid] < 0)
+        arrived[pid] = (arrived[pid] ?? 0n) - BigInt(q);
+        if (arrived[pid] < 0n)
           throw bad(`采购单 ${poId} 商品 ${pid} 未冲销累计退货超过有效到货量`);
       }
     }
     for (const [pid, q] of Object.entries(arrived)) {
-      if (q > (po.ordered[pid] ?? 0))
+      if (q > BigInt(po.ordered[pid] ?? 0))
         throw bad(`采购单 ${poId} 商品 ${pid} 有效到货（未冲销到货减未冲销退货）超过订购量`);
     }
-    const cancelled = nullProto<Record<string, number>>();
+    const cancelled = nullProto<Record<string, bigint>>();
     for (const [canId, can] of Object.entries(store.cancels)) {
       if (can.poId !== poId) continue;
       const isReversed = Object.values(store.reversals).some((r) => r.orig === canId);
       if (isReversed) continue; // 已整单冲销的取消不再计入有效取消
       for (const [pid, q] of Object.entries(can.qty)) {
-        cancelled[pid] = (cancelled[pid] ?? 0) + q;
-        if ((arrived[pid] ?? 0) + cancelled[pid] > po.ordered[pid])
+        cancelled[pid] = (cancelled[pid] ?? 0n) + BigInt(q);
+        if ((arrived[pid] ?? 0n) + cancelled[pid] > BigInt(po.ordered[pid]))
           throw bad(`采购单 ${poId} 商品 ${pid} 有效到货与有效取消合计超过订购量（待到货量为负）`);
       }
     }
@@ -1212,27 +1214,31 @@ class Ledger {
     return this.base.arrivals[arrId] !== undefined ? 'store' : 'batch';
   }
 
-  /** 计算某采购单各商品当前“有效到货”：未冲销累计到货 - 未冲销累计退货。 */
-  private effectiveArrived(poId: string): Record<string, number> {
-    const arrived = nullProto<Record<string, number>>();
+  /**
+   * 计算某采购单各商品当前“有效到货”：未冲销累计到货 - 未冲销累计退货。
+   * 累计总量可超过安全整数范围（反复退货、补收），必须用 BigInt 精确累计，
+   * 不得因中间累计舍入而改变净量；单票数量本身仍为正安全整数。
+   */
+  private effectiveArrived(poId: string): Record<string, bigint> {
+    const arrived = nullProto<Record<string, bigint>>();
     for (const [arrId, arr] of Object.entries(this.arrivals)) {
       if (arr.poId !== poId || this.reversedOrigs.has(arrId)) continue;
-      for (const [pid, q] of Object.entries(arr.qty)) arrived[pid] = (arrived[pid] ?? 0) + q;
+      for (const [pid, q] of Object.entries(arr.qty)) arrived[pid] = (arrived[pid] ?? 0n) + BigInt(q);
     }
     // 未冲销退货抵减有效到货（有未冲销退货的到货单禁止冲销，故其原到货必然计入上行）
     for (const [retId, ret] of Object.entries(this.returns)) {
       if (ret.poId !== poId || this.reversedOrigs.has(retId)) continue;
-      for (const [pid, q] of Object.entries(ret.qty)) arrived[pid] = (arrived[pid] ?? 0) - q;
+      for (const [pid, q] of Object.entries(ret.qty)) arrived[pid] = (arrived[pid] ?? 0n) - BigInt(q);
     }
     return arrived;
   }
 
-  /** 计算某采购单各商品当前“未冲销累计取消”（仅计入尚未被整单冲销的取消单）。 */
-  private effectiveCancelled(poId: string): Record<string, number> {
-    const cancelled = nullProto<Record<string, number>>();
+  /** 计算某采购单各商品当前“未冲销累计取消”（仅计入尚未被整单冲销的取消单）；BigInt 精确累计。 */
+  private effectiveCancelled(poId: string): Record<string, bigint> {
+    const cancelled = nullProto<Record<string, bigint>>();
     for (const [canId, can] of Object.entries(this.cancels)) {
       if (can.poId !== poId || this.reversedOrigs.has(canId)) continue;
-      for (const [pid, q] of Object.entries(can.qty)) cancelled[pid] = (cancelled[pid] ?? 0) + q;
+      for (const [pid, q] of Object.entries(can.qty)) cancelled[pid] = (cancelled[pid] ?? 0n) + BigInt(q);
     }
     return cancelled;
   }
@@ -1335,13 +1341,15 @@ class Ledger {
 
     for (const pid of pids) {
       const qty = req.items.get(pid)!;
-      const cancelled = cancelledBefore[pid] ?? 0;
-      const cumulative = (arrivedBefore[pid] ?? 0) + qty; // 含本次的未冲销累计到货
+      const cancelled = cancelledBefore[pid] ?? 0n;
+      const arrivedEff = arrivedBefore[pid] ?? 0n;
+      const ordered = BigInt(po.ordered[pid]);
+      const cumulative = arrivedEff + BigInt(qty); // 含本次的有效到货（BigInt 精确累计）
       // 待到货量 = 订购量 - 有效到货量 - 有效取消量；本次到货只能使用扣除有效取消后的待到货量
-      if (cumulative + cancelled > po.ordered[pid])
+      if (cumulative + cancelled > ordered)
         throw new BizError(
-          `商品 ${pid} 到货超收：订购 ${po.ordered[pid]}，此前有效到货 ${arrivedBefore[pid] ?? 0}，` +
-            `有效取消 ${cancelled}，待到货 ${po.ordered[pid] - (arrivedBefore[pid] ?? 0) - cancelled}，本次 ${qty}，拒绝整单`,
+          `商品 ${pid} 到货超收：订购 ${po.ordered[pid]}，此前有效到货 ${arrivedEff}，` +
+            `有效取消 ${cancelled}，待到货 ${ordered - arrivedEff - cancelled}，本次 ${qty}，拒绝整单`,
         );
       const before = getStock(this.draft, pid, wh);
       const after = before + qty;
@@ -1358,8 +1366,8 @@ class Ledger {
         seq: ++this.seq, doc: req.arrId, type: 'arrival', product: pid, wh,
         qty, before, after, po: req.poId,
       });
-      const cumulative = (arrivedBefore[pid] ?? 0) + qty;
-      const remaining = po.ordered[pid] - cumulative - (cancelledBefore[pid] ?? 0);
+      const cumulative = (arrivedBefore[pid] ?? 0n) + BigInt(qty);
+      const remaining = BigInt(po.ordered[pid]) - cumulative - (cancelledBefore[pid] ?? 0n);
       qtyRecord[pid] = qty;
       reportLines.push(
         `到货 ${pid} @${wh} +${qty}：库存 ${before} -> ${after}；有效到货 ${cumulative}/${po.ordered[pid]}，待到货 ${remaining}`,
@@ -1430,11 +1438,11 @@ class Ledger {
     for (const pid of pids) {
       const qty = req.items.get(pid)!;
       const remaining =
-        po.ordered[pid] - (arrived[pid] ?? 0) - (cancelledBefore[pid] ?? 0);
-      if (qty > remaining)
+        BigInt(po.ordered[pid]) - (arrived[pid] ?? 0n) - (cancelledBefore[pid] ?? 0n);
+      if (BigInt(qty) > remaining)
         throw new BizError(
-          `商品 ${pid} 取消量超出待到货量：订购 ${po.ordered[pid]}，有效到货 ${arrived[pid] ?? 0}，` +
-            `有效取消 ${cancelledBefore[pid] ?? 0}，待到货 ${remaining}，本次取消 ${qty}，拒绝整单`,
+          `商品 ${pid} 取消量超出待到货量：订购 ${po.ordered[pid]}，有效到货 ${arrived[pid] ?? 0n}，` +
+            `有效取消 ${cancelledBefore[pid] ?? 0n}，待到货 ${remaining}，本次取消 ${qty}，拒绝整单`,
         );
     }
 
@@ -1442,8 +1450,8 @@ class Ledger {
     const reportLines: string[] = [];
     for (const pid of pids) {
       const qty = req.items.get(pid)!;
-      const effAfter = (cancelledBefore[pid] ?? 0) + qty; // 含本次的有效取消
-      const remainingAfter = po.ordered[pid] - (arrived[pid] ?? 0) - effAfter;
+      const effAfter = (cancelledBefore[pid] ?? 0n) + BigInt(qty); // 含本次的有效取消
+      const remainingAfter = BigInt(po.ordered[pid]) - (arrived[pid] ?? 0n) - effAfter;
       qtyRecord[pid] = qty;
       reportLines.push(
         `取消 ${pid} x${qty}：有效取消 ${effAfter}，待到货 ${remainingAfter}（只减少待收承诺，不改库存）`,
@@ -1546,8 +1554,8 @@ class Ledger {
         qty, before, after, po: poId, arr: req.arrId,
       });
       // 退货后有效到货下降，相应数量重新待到货、等待补收
-      const effAfter = (arrivedEff[pid] ?? 0) - qty;
-      const remaining = po.ordered[pid] - effAfter - (cancelled[pid] ?? 0);
+      const effAfter = (arrivedEff[pid] ?? 0n) - BigInt(qty);
+      const remaining = BigInt(po.ordered[pid]) - effAfter - (cancelled[pid] ?? 0n);
       qtyRecord[pid] = qty;
       reportLines.push(
         `退货 ${pid} @${wh} -${qty}：库存 ${before} -> ${after}；有效到货降至 ${effAfter}/${po.ordered[pid]}，待到货 ${remaining}（等待补收）`,
@@ -1937,8 +1945,8 @@ class Ledger {
         qty, before, after, po: poId, orig: origId,
       });
       // 冲销后有效到货 = 原有效到货 - 本单数量；待到货相应回升
-      const effAfter = (arrivedBefore[pid] ?? 0) - qty;
-      const remainingAfter = po.ordered[pid] - effAfter - (cancelledBefore[pid] ?? 0);
+      const effAfter = (arrivedBefore[pid] ?? 0n) - BigInt(qty);
+      const remainingAfter = BigInt(po.ordered[pid]) - effAfter - (cancelledBefore[pid] ?? 0n);
       reportLines.push(
         `冲销到货 原单=${origId} 采购单=${poId} 商品=${pid} @${wh} -${qty}：${before} -> ${after}；有效到货降至 ${effAfter}/${po.ordered[pid]}，待到货 ${remainingAfter}`,
       );
@@ -1983,8 +1991,8 @@ class Ledger {
     for (const pid of pids) {
       const qty = origCan.qty[pid];
       // 冲销后有效取消 = 原有效取消 - 本单数量；待到货相应回升
-      const effAfter = (cancelledBefore[pid] ?? 0) - qty;
-      const remainingAfter = po.ordered[pid] - (arrived[pid] ?? 0) - effAfter;
+      const effAfter = (cancelledBefore[pid] ?? 0n) - BigInt(qty);
+      const remainingAfter = BigInt(po.ordered[pid]) - (arrived[pid] ?? 0n) - effAfter;
       reportLines.push(
         `冲销取消 原单=${origId} 采购单=${poId} 商品=${pid} 本次恢复取消量 ${qty}：` +
           `有效取消降至 ${effAfter}，待到货 ${remainingAfter}（不改库存）`,
@@ -2038,10 +2046,10 @@ class Ledger {
         throw new BizError(
           `冲销退货原单 ${origId}：商品 ${pid} 原收货仓 ${wh} 补回后余量超出安全整数范围，拒绝整单`,
         );
-      const effAfter = (arrivedEff[pid] ?? 0) + qty;
-      if (effAfter + (cancelled[pid] ?? 0) > po.ordered[pid])
+      const effAfter = (arrivedEff[pid] ?? 0n) + BigInt(qty);
+      if (effAfter + (cancelled[pid] ?? 0n) > BigInt(po.ordered[pid]))
         throw new BizError(
-          `冲销退货原单 ${origId}：商品 ${pid} 恢复后有效到货 ${effAfter} 与有效取消 ${cancelled[pid] ?? 0}` +
+          `冲销退货原单 ${origId}：商品 ${pid} 恢复后有效到货 ${effAfter} 与有效取消 ${cancelled[pid] ?? 0n}` +
             ` 合计超过订购量 ${po.ordered[pid]}，拒绝整单`,
         );
     }
@@ -2057,8 +2065,8 @@ class Ledger {
         qty, before, after, po: poId, arr: arrId, orig: origId,
       });
       // 冲销后有效到货 = 原有效到货 + 本单退货量；待到货相应回落
-      const effAfter = (arrivedEff[pid] ?? 0) + qty;
-      const remainingAfter = po.ordered[pid] - effAfter - (cancelled[pid] ?? 0);
+      const effAfter = (arrivedEff[pid] ?? 0n) + BigInt(qty);
+      const remainingAfter = BigInt(po.ordered[pid]) - effAfter - (cancelled[pid] ?? 0n);
       reportLines.push(
         `冲销退货 原单=${origId} 原到货单=${arrId} 采购单=${poId} 商品=${pid} @${wh} +${qty}：${before} -> ${after}；有效到货回升至 ${effAfter}/${po.ordered[pid]}，待到货 ${remainingAfter}`,
       );
@@ -2247,41 +2255,45 @@ function runReverse(rest: string[], dataDir: string, store: Store): void {
   for (const line of outcome.lines) console.log(line);
 }
 
-/** 计算采购单各商品的有效到货（未冲销到货-未冲销退货）、有效退货、有效取消与待到货量。 */
+/**
+ * 计算采购单各商品的有效到货（未冲销到货-未冲销退货）、有效退货、有效取消与待到货量。
+ * 累计总量可超过安全整数范围（反复退货、补收），一律用 BigInt 精确累计，
+ * 合计与记录枚举顺序无关；有效退货合计即使超过安全整数范围也能完整显示。
+ */
 function purchaseProgress(store: Store, poId: string): {
-  effective: Record<string, number>;
-  returned: Record<string, number>;
-  cancelled: Record<string, number>;
-  remaining: Record<string, number>;
+  effective: Record<string, bigint>;
+  returned: Record<string, bigint>;
+  cancelled: Record<string, bigint>;
+  remaining: Record<string, bigint>;
 } {
-  const effective = nullProto<Record<string, number>>();
+  const effective = nullProto<Record<string, bigint>>();
   for (const [arrId, arr] of Object.entries(store.arrivals)) {
     if (arr.poId !== poId) continue;
     const isReversed = Object.values(store.reversals).some((r) => r.orig === arrId);
     if (isReversed) continue;
-    for (const [pid, q] of Object.entries(arr.qty)) effective[pid] = (effective[pid] ?? 0) + q;
+    for (const [pid, q] of Object.entries(arr.qty)) effective[pid] = (effective[pid] ?? 0n) + BigInt(q);
   }
-  const returned = nullProto<Record<string, number>>();
+  const returned = nullProto<Record<string, bigint>>();
   for (const [retId, ret] of Object.entries(store.returns)) {
     if (ret.poId !== poId) continue;
     const isReversed = Object.values(store.reversals).some((r) => r.orig === retId);
     if (isReversed) continue;
     for (const [pid, q] of Object.entries(ret.qty)) {
-      returned[pid] = (returned[pid] ?? 0) + q;
-      effective[pid] = (effective[pid] ?? 0) - q; // 未冲销退货抵减有效到货
+      returned[pid] = (returned[pid] ?? 0n) + BigInt(q);
+      effective[pid] = (effective[pid] ?? 0n) - BigInt(q); // 未冲销退货抵减有效到货
     }
   }
-  const cancelled = nullProto<Record<string, number>>();
+  const cancelled = nullProto<Record<string, bigint>>();
   for (const [canId, can] of Object.entries(store.cancels)) {
     if (can.poId !== poId) continue;
     const isReversed = Object.values(store.reversals).some((r) => r.orig === canId);
     if (isReversed) continue;
-    for (const [pid, q] of Object.entries(can.qty)) cancelled[pid] = (cancelled[pid] ?? 0) + q;
+    for (const [pid, q] of Object.entries(can.qty)) cancelled[pid] = (cancelled[pid] ?? 0n) + BigInt(q);
   }
   const po = store.purchases[poId];
-  const remaining = nullProto<Record<string, number>>();
+  const remaining = nullProto<Record<string, bigint>>();
   for (const [pid, ordered] of Object.entries(po.ordered)) {
-    remaining[pid] = ordered - (effective[pid] ?? 0) - (cancelled[pid] ?? 0);
+    remaining[pid] = BigInt(ordered) - (effective[pid] ?? 0n) - (cancelled[pid] ?? 0n);
   }
   return { effective, returned, cancelled, remaining };
 }
@@ -2289,17 +2301,17 @@ function purchaseProgress(store: Store, poId: string): {
 /**
  * 单商品采购状态。无取消时保持原有展示（未到货/部分到货/收齐）；
  * 有取消时区分仍待收与已结清：待到货为零但含取消的结清不报“收齐”，
- * 取消永远不计作到货。
+ * 取消永远不计作到货。进度量以 BigInt 精确比较。
  */
-function poStatus(ordered: number, effective: number, cancelled = 0): string {
-  const remaining = ordered - effective - cancelled;
-  if (cancelled === 0) {
-    if (effective === 0) return '未到货';
-    if (remaining > 0) return '部分到货';
+function poStatus(ordered: number, effective: bigint, cancelled = 0n): string {
+  const remaining = BigInt(ordered) - effective - cancelled;
+  if (cancelled === 0n) {
+    if (effective === 0n) return '未到货';
+    if (remaining > 0n) return '部分到货';
     return '收齐';
   }
-  if (remaining > 0) return effective === 0 ? '未到货（仍待收）' : '部分到货（仍待收）';
-  return effective === ordered ? '收齐' : '已结清（含取消）';
+  if (remaining > 0n) return effective === 0n ? '未到货（仍待收）' : '部分到货（仍待收）';
+  return effective === BigInt(ordered) ? '收齐' : '已结清（含取消）';
 }
 
 function printPurchase(store: Store, poId: string, po: PurchaseRecord): void {
@@ -2322,11 +2334,12 @@ function printPurchase(store: Store, poId: string, po: PurchaseRecord): void {
   console.log(cols.join('\t'));
   for (const pid of Object.keys(po.ordered).sort()) {
     const ordered = po.ordered[pid];
-    const got = effective[pid] ?? 0;
-    const ret = returned[pid] ?? 0;
-    const can = cancelled[pid] ?? 0;
+    const got = effective[pid] ?? 0n;
+    const ret = returned[pid] ?? 0n;
+    const can = cancelled[pid] ?? 0n;
     const wait = remaining[pid];
-    const row: (string | number)[] = [pid, ordered, got];
+    // BigInt 直接插值：超过安全整数范围的合计仍显示完整十进制整数
+    const row: (string | number | bigint)[] = [pid, ordered, got];
     if (hasReturns) row.push(ret);
     if (hasCancels) row.push(can);
     row.push(wait, poStatus(ordered, got, can));
@@ -2452,12 +2465,12 @@ function runPo(rest: string[], dataDir: string, store: Store): void {
       const po = store.purchases[poId];
       const { cancelled, remaining } = purchaseProgress(store, poId);
       const pids = Object.keys(po.ordered).sort();
-      const anyCancelled = pids.some((pid) => (cancelled[pid] ?? 0) > 0);
+      const anyCancelled = pids.some((pid) => (cancelled[pid] ?? 0n) > 0n);
       // 单张采购单汇总状态：全部结清（待到货为零）时，无取消为收齐、含取消为已结清；
       // 全部仍完全待到货为未到货；否则部分到货。无取消采购的展示行为保持不变。
       let overall: string;
-      if (pids.every((pid) => remaining[pid] === 0)) overall = anyCancelled ? '已结清（含取消）' : '收齐';
-      else if (pids.every((pid) => remaining[pid] === po.ordered[pid])) overall = '未到货';
+      if (pids.every((pid) => remaining[pid] === 0n)) overall = anyCancelled ? '已结清（含取消）' : '收齐';
+      else if (pids.every((pid) => remaining[pid] === BigInt(po.ordered[pid]))) overall = '未到货';
       else overall = '部分到货';
       console.log(`${poId}\t供应商=${po.supplier}\t收货仓=${po.wh}\t${Object.keys(po.ordered).length} 种商品\t${overall}`);
     }
@@ -2645,7 +2658,8 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   po show 显示供应商、收货仓、各商品订购/有效到货/有效退货/有效取消/待到货量及
   仍待收、收齐、已结清状态（取消、退货均不计作到货、不会误报收齐），并列出到
   货单、取消单、退货单与冲销单关联；flow 可凭采购单编号追溯到货、退货与各自
-  冲销流水。
+  冲销流水。进度按精确整数计算：反复退货、补收下累计到货或退货可超过安全整数
+  上限，净进度不受影响；有效退货合计超安全整数时仍显示完整十进制整数。
 
 冲销规则：
   冲销在“当前余量”上应用原单的相反变动，不回滚原单之后的其他业务、不恢复绝对
