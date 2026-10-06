@@ -2461,6 +2461,256 @@ function runFlow(rest: string[], store: Store): void {
   for (const line of status) console.log(line);
 }
 
+// ---------- 期间库存对账报表 ----------
+
+/** 带符号 BigInt 文本：正数加 +，负数保留 -，零为 0。 */
+function fmtSignedBig(n: bigint): string {
+  return n > 0n ? `+${n}` : String(n);
+}
+
+const ENTRY_TYPE_ORDER: EntryType[] = [
+  'in', 'out', 'transfer', 'count', 'arrival', 'return',
+  'in-rev', 'out-rev', 'transfer-rev', 'count-rev', 'arrival-rev', 'return-rev',
+];
+
+/**
+ * 出报表前核对完整库存流水（只读核对，不自动修复）：
+ * 1) 同一（商品, 仓库）的流水按提交顺序余量连续（上笔后量 = 下笔前量）；
+ * 2) 调拨/冲销调拨同一单据同一商品两端完整（调出、调入各一条，数量与方向一致）；
+ * 3) 每个组合末笔余量与当前实存一致（双向：有流水无实存、有实存无流水均不允许）。
+ * 任一不一致明确报错（数据损坏，退出 1），不输出部分报表。
+ */
+function verifyLedgerIntegrity(store: Store): void {
+  const lastByCombo = new Map<string, LedgerEntry>();
+  for (const e of store.entries) {
+    const key = JSON.stringify([e.product, e.wh]);
+    const prev = lastByCombo.get(key);
+    if (prev !== undefined && prev.after !== e.before)
+      throw new DataError(
+        `库存流水余量不连续：商品 ${e.product} 仓库 ${e.wh} 流水 #${prev.seq} 后余量 ${prev.after}，` +
+          `流水 #${e.seq} 前余量 ${e.before}，数据不一致，拒绝输出对账报表（不自动修复）`,
+      );
+    lastByCombo.set(key, e);
+  }
+  for (const [key, e] of lastByCombo) {
+    const [pid, wh] = JSON.parse(key) as [string, string];
+    const cur = getStock(store.stock, pid, wh);
+    if (e.after !== cur)
+      throw new DataError(
+        `商品 ${pid} 仓库 ${wh} 末笔流水 #${e.seq} 余量 ${e.after} 与当前实存 ${cur} 不一致，` +
+          `数据不一致，拒绝输出对账报表（不自动修复）`,
+      );
+  }
+  for (const pid of Object.keys(store.stock)) {
+    for (const wh of Object.keys(store.stock[pid])) {
+      if (store.stock[pid][wh] !== 0 && !lastByCombo.has(JSON.stringify([pid, wh])))
+        throw new DataError(
+          `商品 ${pid} 仓库 ${wh} 当前实存 ${store.stock[pid][wh]} 没有任何库存流水支撑，` +
+            `数据不一致，拒绝输出对账报表（不自动修复）`,
+        );
+    }
+  }
+  // 调拨两端完整性：同一单据同一商品的调拨（或冲销调拨）必须调出、调入各一条，数量与方向一致
+  const sides = new Map<string, LedgerEntry[]>();
+  for (const e of store.entries) {
+    if (e.type !== 'transfer' && e.type !== 'transfer-rev') continue;
+    const key = JSON.stringify([e.doc, e.product, e.type]);
+    const list = sides.get(key);
+    if (list === undefined) sides.set(key, [e]);
+    else list.push(e);
+  }
+  for (const [key, list] of sides) {
+    const [doc, product, type] = JSON.parse(key) as [string, string, EntryType];
+    const label = TYPE_LABEL[type];
+    if (list.length !== 2)
+      throw new DataError(
+        `${label}流水两端不完整：单据 ${doc} 商品 ${product} 只有 ${list.length} 条流水，` +
+          `数据不一致，拒绝输出对账报表（不自动修复）`,
+      );
+    const [a, b] = list;
+    const whPair = [a.wh, b.wh].sort();
+    const expect = [a.from!, a.to!].sort();
+    if (
+      a.from !== b.from || a.to !== b.to || a.qty !== b.qty ||
+      whPair[0] !== expect[0] || whPair[1] !== expect[1]
+    )
+      throw new DataError(
+        `${label}流水两端不一致：单据 ${doc} 商品 ${product} 的调出/调入仓或数量不符，` +
+          `数据不一致，拒绝输出对账报表（不自动修复）`,
+      );
+  }
+}
+
+interface ReconCombo {
+  pid: string;
+  wh: string;
+  begin: number; // 期初余量（起点单据全部流水完成后的状态；无起点为零）
+  end: number; // 期末余量（终点单据全部流水完成后；无终点为当前实存）
+  inc: bigint; // 期间增加非负合计（精确整数）
+  dec: bigint; // 期间减少非负合计（精确整数）
+  subtotals: Map<EntryType, bigint>; // 期间内各业务类型（区分是否冲销）带符号净变动
+  hasFlow: boolean; // 期间内是否有流水
+}
+
+/**
+ * 期间库存对账报表（只读：不创建或改写数据、历史结果及关联）。
+ * 起点表示该单全部流水完成后的状态（期间不含起点），终点包含该单全部流水；
+ * 同一单作两端为空期间；不指定起点从零库存开始，不指定终点截至当前。
+ * 边界仅接受已成功且有库存流水的单据（冲销单、零差额盘点可用；只有采购或取消
+ * 记录的编号不可用；同名采购单不干扰库存单定位），按首次提交顺序（流水序号）
+ * 比较，起点晚于终点或单据不存在拒绝。先确定全局边界再按商品/仓库筛选，
+ * 不拆开多商品单据或调拨两端。
+ */
+function runRecon(rest: string[], store: Store): void {
+  const args = parseArgs(rest, ['--from', '--to', '--product', '--wh']);
+  if (args.positionals.length > 0)
+    throw new UsageError(
+      '用法：recon [--from <起点单据编号>] [--to <终点单据编号>] [--product <商品编号>] [--wh <仓库>]',
+    );
+  const fromId =
+    args.flags['--from'] === undefined ? undefined : trimOrThrow('起点单据编号', args.flags['--from']);
+  const toId =
+    args.flags['--to'] === undefined ? undefined : trimOrThrow('终点单据编号', args.flags['--to']);
+  const pid =
+    args.flags['--product'] === undefined ? undefined : trimOrThrow('商品编号', args.flags['--product']);
+  const wid = args.flags['--wh'] === undefined ? undefined : trimOrThrow('仓库标识', args.flags['--wh']);
+
+  // 出报表前核对完整库存流水；不一致明确报错，不输出部分报表、不自动修复
+  verifyLedgerIntegrity(store);
+
+  // 边界定位（全局）：仅接受有库存流水的单据编号；采购编号空间独立，同名采购不干扰定位
+  const docLastSeq = nullProto<Record<string, number>>();
+  for (const e of store.entries) docLastSeq[e.doc] = e.seq;
+  const boundary = (id: string, label: string): number => {
+    const seq = docLastSeq[id];
+    if (seq !== undefined) return seq;
+    if (store.purchases[id] !== undefined)
+      throw new BizError(`${label}单据 ${id} 只有采购登记记录，没有库存流水，不能用作期间边界`);
+    if (store.cancels[id] !== undefined)
+      throw new BizError(`${label}单据 ${id} 只有取消记录，没有库存流水，不能用作期间边界`);
+    if (store.reversals[id] !== undefined)
+      throw new BizError(`${label}单据 ${id} 是冲销取消单的冲销单，没有库存流水，不能用作期间边界`);
+    throw new BizError(`${label}单据 ${id} 不存在或没有库存流水，不能用作期间边界`);
+  };
+  const startBound = fromId === undefined ? 0 : boundary(fromId, '起点');
+  const endBound = toId === undefined ? Number.POSITIVE_INFINITY : boundary(toId, '终点');
+  if (startBound > endBound)
+    throw new BizError(`起点单据 ${fromId} 的提交顺序晚于终点单据 ${toId}，期间无效，拒绝生成报表`);
+
+  // 先确定全局边界，再按商品/仓库筛选；期间 = (起点末笔流水, 终点末笔流水]
+  const beginOf = nullProto<Record<string, Record<string, number>>>();
+  const endOf = nullProto<Record<string, Record<string, number>>>();
+  const combos = new Map<string, ReconCombo>();
+  const periodEntries: LedgerEntry[] = [];
+  for (const e of store.entries) {
+    if (e.seq <= startBound) (beginOf[e.product] ??= nullProto<Record<string, number>>())[e.wh] = e.after;
+    if (e.seq <= endBound) (endOf[e.product] ??= nullProto<Record<string, number>>())[e.wh] = e.after;
+    const match = (pid === undefined || e.product === pid) && (wid === undefined || e.wh === wid);
+    if (!match) continue;
+    const key = JSON.stringify([e.product, e.wh]);
+    if (e.seq <= endBound && !combos.has(key)) {
+      combos.set(key, {
+        pid: e.product, wh: e.wh, begin: 0, end: 0,
+        inc: 0n, dec: 0n, subtotals: new Map(), hasFlow: false,
+      });
+    }
+    if (e.seq > startBound && e.seq <= endBound) periodEntries.push(e);
+  }
+  for (const c of combos.values()) {
+    c.begin = beginOf[c.pid]?.[c.wh] ?? 0;
+    c.end = endOf[c.pid]?.[c.wh] ?? 0;
+  }
+  for (const e of periodEntries) {
+    const c = combos.get(JSON.stringify([e.product, e.wh]))!;
+    c.hasFlow = true;
+    const delta = BigInt(e.after) - BigInt(e.before);
+    if (delta > 0n) c.inc += delta;
+    else c.dec += -delta;
+    c.subtotals.set(e.type, (c.subtotals.get(e.type) ?? 0n) + delta);
+  }
+
+  // 原单冲销状态以终点时刻为准：终点之后的冲销不影响历史报表
+  const revLastSeq = nullProto<Record<string, number>>();
+  for (const e of store.entries) if (REV_ENTRY_TYPES.has(e.type)) revLastSeq[e.doc] = e.seq;
+  const reversedByEnd = nullProto<Record<string, string>>();
+  for (const [revId, rec] of Object.entries(store.reversals)) {
+    const seq = revLastSeq[revId];
+    if (seq !== undefined && seq <= endBound) reversedByEnd[rec.orig] = revId;
+  }
+
+  const fromDesc = fromId === undefined ? '零库存（无起点）' : `单据 ${fromId} 全部流水完成后（不含该单）`;
+  const toDesc = toId === undefined ? '当前（无终点）' : `单据 ${toId} 全部流水完成后（含该单）`;
+  const scope = [pid !== undefined ? `商品=${pid}` : null, wid !== undefined ? `仓库=${wid}` : null]
+    .filter(Boolean)
+    .join(' ');
+  console.log('期间库存对账报表：');
+  console.log(`期间：起点=${fromDesc}；终点=${toDesc}`);
+  console.log(scope === '' ? '筛选：无（覆盖全库）' : `筛选：${scope}`);
+  console.log(
+    `数据核对通过：完整流水 ${store.entries.length} 条余量连续、调拨两端完整、末笔余量与当前实存一致`,
+  );
+
+  // 展示期初或期末非零及期间有流水的组合，按商品、仓库标识升序
+  const shown = [...combos.values()]
+    .filter((c) => c.begin !== 0 || c.end !== 0 || c.hasFlow)
+    .sort((a, b) =>
+      a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : a.wh < b.wh ? -1 : a.wh > b.wh ? 1 : 0,
+    );
+  if (shown.length === 0) {
+    console.log('（无匹配组合：所选范围内期初、期末均为零且期间无流水）');
+  }
+  for (const c of shown) {
+    const net = c.inc - c.dec;
+    if (BigInt(c.begin) + net !== BigInt(c.end))
+      throw new DataError(
+        `商品 ${c.pid} 仓库 ${c.wh} 期初 ${c.begin} + 净变动 ${net} 与期末 ${c.end} 不符，` +
+          `数据不一致，拒绝输出对账报表（不自动修复）`,
+      );
+    console.log(
+      `组合 商品=${c.pid} 仓库=${c.wh}：期初 ${c.begin}，期间增加 ${c.inc}，期间减少 ${c.dec}，` +
+        `净变动 ${fmtSignedBig(net)}，期末 ${c.end}（期初 + 增加 - 减少 = 期末）`,
+    );
+    const parts: string[] = [];
+    for (const t of ENTRY_TYPE_ORDER) {
+      const v = c.subtotals.get(t);
+      if (v !== undefined) parts.push(`${TYPE_LABEL[t]} ${fmtSignedBig(v)}`);
+    }
+    console.log(parts.length === 0 ? '  业务小计：（期间无流水）' : `  业务小计：${parts.join('；')}`);
+  }
+
+  // 期间匹配流水按提交顺序列出（含采购、原到货及冲销关联）
+  console.log(`期间流水（${periodEntries.length} 条，按提交顺序）：`);
+  if (periodEntries.length === 0) console.log('（无期间流水）');
+  else for (const e of periodEntries) console.log(formatEntry(e));
+  const origDocs = new Set(periodEntries.filter((e) => e.orig === undefined).map((e) => e.doc));
+  for (const docId of [...origDocs].sort()) {
+    const revId = reversedByEnd[docId];
+    if (revId !== undefined) console.log(`原单 ${docId} 已由冲销单 ${revId} 冲销（以终点时刻为准）`);
+  }
+
+  // 逐商品汇总所选仓库（精确整数累计，超安全整数仍完整十进制显示）
+  if (shown.length > 0) {
+    const byProduct = new Map<string, { begin: bigint; inc: bigint; dec: bigint; end: bigint; whs: Set<string> }>();
+    for (const c of shown) {
+      const s = byProduct.get(c.pid) ?? { begin: 0n, inc: 0n, dec: 0n, end: 0n, whs: new Set<string>() };
+      s.begin += BigInt(c.begin);
+      s.inc += c.inc;
+      s.dec += c.dec;
+      s.end += BigInt(c.end);
+      s.whs.add(c.wh);
+      byProduct.set(c.pid, s);
+    }
+    console.log('逐商品汇总（所选仓库范围）：');
+    for (const [pid2, s] of [...byProduct.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      const whList = [...s.whs].sort().join('、');
+      console.log(
+        `商品 ${pid2}（仓库：${whList}）：期初 ${s.begin}，期间增加 ${s.inc}，期间减少 ${s.dec}，` +
+          `净变动 ${fmtSignedBig(s.inc - s.dec)}，期末 ${s.end}`,
+      );
+    }
+  }
+}
+
 function runReverse(rest: string[], dataDir: string, store: Store): void {
   const args = parseArgs(rest, ['--orig']);
   const revRaw = args.positionals[0];
@@ -3410,6 +3660,8 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
        | --wh <仓库> [--product <编号>]
+  recon [--from <起点单据>] [--to <终点单据>]
+        [--product <编号>] [--wh <仓库>]     期间库存对账报表（只读；起点不含、终点含）
   -h, --help                                显示本帮助
 
 规则：
@@ -3533,6 +3785,25 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   执行方案重放只返回原落单结果，不再核对、不再生效、不改写文件；其子单后
   来冲销、取消或到货也不重建。
 
+期间库存对账报表：
+  recon 生成可追溯的期间库存对账报表（只读，不创建或改写数据、历史结果及关联）。
+  --from 指定起点单据（期间不含起点，表示该单全部流水完成后的状态），--to 指
+  定终点单据（含该单全部流水）；不指定起点从零库存开始，不指定终点截至当前；
+  同一单作两端为空期间。边界仅接受已成功且有库存流水的单据（冲销单、零差额
+  盘点可用；只有采购或取消记录的编号不可用；同名采购单不干扰库存单定位），
+  按首次提交顺序比较而非编号排序；单据不存在或起点晚于终点拒绝（退出 1）。
+  可按 --product、--wh 单独或同时筛选，不筛选覆盖全库；先确定全局边界再筛
+  选，不拆开多商品单据或调拨两端。每个商品仓库组合展示期初、期间增加与减少
+  的非负合计、净变动与期末（期初 + 增加 - 减少 = 期末），并按业务类型及是
+  否冲销分别列出带符号净变动小计；调拨按各仓实际方向统计，到货、退货及反向
+  冲销计入实存，采购登记、取消及其冲销不计入；盘点按实际差额统计，零差额仍
+  保留追溯；已冲销原单保留当时变动，冲销只在其发生的期间计入。期间匹配流水
+  按提交顺序列出（含采购、原到货及冲销关联），原单冲销状态以终点时刻为准；
+  组合按商品、仓库标识升序，展示期初或期末非零及期间有流水的组合，无匹配明
+  确提示；逐商品汇总所选仓库，累计量及合计用精确整数，超安全整数仍完整十进
+  制显示。出报表前核对完整流水余量连续性、调拨两端完整性及末笔余量与当前实
+  存一致，不一致明确报错（退出 1），不输出部分报表、不自动修复。
+
 示例：
   node app.ts -d ./data product add P1 螺丝
   node app.ts -d ./data in D1 --wh W1 --item P1:10 --item P2:3
@@ -3563,7 +3834,10 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
   node app.ts -d ./data flow --product P1
-  node app.ts -d ./data flow --wh W2`;
+  node app.ts -d ./data flow --wh W2
+  node app.ts -d ./data recon
+  node app.ts -d ./data recon --from D2 --to A1 --product P1
+  node app.ts -d ./data recon --to D3 --wh W1`;
 
 function printHelp(): void {
   console.log(HELP);
@@ -3684,6 +3958,11 @@ function run(argv: string[]): void {
     case 'flow': {
       const store = loadStore(dataDir);
       runFlow(tokens, store);
+      break;
+    }
+    case 'recon': {
+      const store = loadStore(dataDir);
+      runRecon(tokens, store);
       break;
     }
     default:
