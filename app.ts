@@ -17,11 +17,13 @@ type EntryType =
   | DocType
   | 'count'
   | 'arrival'
+  | 'return'
   | 'in-rev'
   | 'out-rev'
   | 'transfer-rev'
   | 'count-rev'
-  | 'arrival-rev';
+  | 'arrival-rev'
+  | 'return-rev';
 
 interface LedgerEntry {
   seq: number; // 全局流水序号，即提交顺序
@@ -34,7 +36,8 @@ interface LedgerEntry {
   after: number;
   from?: string; // 调拨（或冲销调拨）的调出仓
   to?: string; // 调拨（或冲销调拨）的调入仓
-  po?: string; // 到货流水：所属采购单编号
+  po?: string; // 到货/退货流水：所属采购单编号
+  arr?: string; // 退货（及冲销退货）流水：原到货单编号
   orig?: string; // 冲销流水：被冲销的原单编号
   expected?: number; // 盘点（及冲销盘点）流水：预期账面量
   actual?: number; // 盘点（及冲销盘点）流水：实盘量
@@ -72,6 +75,13 @@ interface CancelRecord {
   resultLines: string[]; // 取消提交结果，供幂等重放
 }
 
+interface ReturnRecord {
+  arrId: string; // 原到货单编号
+  wh: string; // 原到货收货仓（冗余自到货单，便于校验与展示）
+  qty: Record<string, number>; // 本次退货：商品 -> 数量（合并后，正安全整数）
+  resultLines: string[]; // 退货提交结果，供幂等重放
+}
+
 interface Store {
   version: 1;
   products: Record<string, string>; // 编号 -> 名称（编号区分大小写；null 原型，防特殊键串改）
@@ -82,9 +92,10 @@ interface Store {
   purchases: Record<string, PurchaseRecord>; // 采购单登记（独立编号空间，不改库存）
   arrivals: Record<string, ArrivalRecord>; // 到货单去重与结果（与库存单共用编号空间）
   cancels: Record<string, CancelRecord>; // 取消单去重与结果（与库存单共用编号空间，不改库存与流水）
+  returns: Record<string, ReturnRecord>; // 退货单去重与结果（与库存单共用编号空间，从原收货仓扣减）
 }
 
-const REV_ENTRY_TYPES = new Set<EntryType>(['in-rev', 'out-rev', 'transfer-rev', 'count-rev', 'arrival-rev']);
+const REV_ENTRY_TYPES = new Set<EntryType>(['in-rev', 'out-rev', 'transfer-rev', 'count-rev', 'arrival-rev', 'return-rev']);
 
 function nullProto<T extends object>(): T {
   return Object.create(null) as T;
@@ -101,6 +112,7 @@ function emptyStore(): Store {
     purchases: nullProto(),
     arrivals: nullProto(),
     cancels: nullProto(),
+    returns: nullProto(),
   };
 }
 
@@ -203,7 +215,8 @@ function validateStore(data: unknown): Store {
     if (typeof e.doc !== 'string' || e.doc.trim() === '') throw bad('流水缺少单据编号');
     const isRev = REV_ENTRY_TYPES.has(e.type as EntryType);
     const isOrig =
-      e.type === 'in' || e.type === 'out' || e.type === 'transfer' || e.type === 'count' || e.type === 'arrival';
+      e.type === 'in' || e.type === 'out' || e.type === 'transfer' || e.type === 'count' ||
+      e.type === 'arrival' || e.type === 'return';
     if (!isRev && !isOrig) throw bad('流水类型非法');
     if (typeof e.product !== 'string' || e.product.trim() === '') throw bad('流水缺少商品编号');
     if (typeof e.wh !== 'string' || e.wh.trim() === '') throw bad('流水缺少仓库标识');
@@ -215,8 +228,8 @@ function validateStore(data: unknown): Store {
       if (e.diff !== e.actual - e.expected) throw bad('盘点流水差额与账面、实盘量不一致');
       const applied = e.type === 'count' ? e.diff : -e.diff; // 冲销盘点应用反向差额
       if (e.after - e.before !== applied) throw bad('盘点流水差额与前后余量不一致');
-      if (e.qty !== undefined || e.from !== undefined || e.to !== undefined || e.po !== undefined)
-        throw bad('盘点流水不应携带数量、调拨或采购字段');
+      if (e.qty !== undefined || e.from !== undefined || e.to !== undefined || e.po !== undefined || e.arr !== undefined)
+        throw bad('盘点流水不应携带数量、调拨、采购或原到货字段');
     } else {
       if (!isPosSafeInt(e.qty)) throw bad('流水数量非法');
       if (e.expected !== undefined || e.actual !== undefined || e.diff !== undefined)
@@ -225,19 +238,28 @@ function validateStore(data: unknown): Store {
       if (e.type === 'transfer' || e.type === 'transfer-rev') {
         if (typeof e.from !== 'string' || e.from.trim() === '' || typeof e.to !== 'string' || e.to.trim() === '')
           throw bad('调拨流水缺少调出/调入仓');
-        if (e.po !== undefined) throw bad('调拨流水不应携带采购字段');
+        if (e.po !== undefined || e.arr !== undefined) throw bad('调拨流水不应携带采购或原到货字段');
         // 调拨：调入仓增加；冲销调拨：原调入仓扣回、原调出仓补回
         const expect = (e.wh === e.to) === (e.type === 'transfer') ? e.qty : -e.qty;
         if (delta !== expect) throw bad('流水差额与前后余量不一致');
       } else {
         if (e.from !== undefined || e.to !== undefined) throw bad('非调拨流水不应携带调拨字段');
-        // 到货入收货仓为增；冲销到货从收货仓扣回为减
-        const increases = e.type === 'in' || e.type === 'out-rev' || e.type === 'arrival';
+        // 到货入收货仓、冲销退货补回原收货仓为增；退货从原收货仓扣减、冲销到货扣回为减
+        const increases =
+          e.type === 'in' || e.type === 'out-rev' || e.type === 'arrival' || e.type === 'return-rev';
         if (delta !== (increases ? e.qty : -e.qty)) throw bad('流水差额与前后余量不一致');
-        if (e.type === 'arrival' || e.type === 'arrival-rev') {
-          if (typeof e.po !== 'string' || e.po.trim() === '') throw bad('到货流水缺少采购单编号');
+        const isPurchaseEntry =
+          e.type === 'arrival' || e.type === 'arrival-rev' || e.type === 'return' || e.type === 'return-rev';
+        if (isPurchaseEntry) {
+          if (typeof e.po !== 'string' || e.po.trim() === '') throw bad('采购相关流水缺少采购单编号');
         } else if (e.po !== undefined) {
-          throw bad('非到货流水不应携带采购字段');
+          throw bad('非采购相关流水不应携带采购字段');
+        }
+        const isReturnEntry = e.type === 'return' || e.type === 'return-rev';
+        if (isReturnEntry) {
+          if (typeof e.arr !== 'string' || e.arr.trim() === '') throw bad('退货流水缺少原到货单编号');
+        } else if (e.arr !== undefined) {
+          throw bad('非退货流水不应携带原到货单字段');
         }
       }
     }
@@ -372,8 +394,45 @@ function validateStore(data: unknown): Store {
     }
   }
 
+  // returns 为新增字段：合法旧数据没有该字段，按无退货处理（原有记录与结果保持不变）。
+  // 退货单与入库/出库/调拨/盘点/到货/取消/冲销单共用全局唯一编号空间；
+  // 退货引用一张原到货单，从原收货仓扣减，只退原到货明细内商品。
+  if (data.returns !== undefined) {
+    if (!isPlainObject(data.returns)) throw bad('returns 不是对象');
+    for (const [retId, rec] of Object.entries(data.returns)) {
+      if (typeof retId !== 'string' || retId.trim() === '') throw bad('存在非法退货单编号');
+      if (store.docs[retId] !== undefined) throw bad(`退货单编号 ${retId} 与原始库存单据编号冲突`);
+      if (store.arrivals[retId] !== undefined) throw bad(`退货单编号 ${retId} 与到货单编号冲突`);
+      if (store.cancels[retId] !== undefined) throw bad(`退货单编号 ${retId} 与取消单编号冲突`);
+      if (
+        !isPlainObject(rec) ||
+        typeof rec.arrId !== 'string' || rec.arrId.trim() === '' ||
+        typeof rec.wh !== 'string' || rec.wh.trim() === '' ||
+        !isPlainObject(rec.qty) ||
+        !Array.isArray(rec.resultLines) || !rec.resultLines.every((l) => typeof l === 'string')
+      )
+        throw bad(`退货单 ${retId} 的记录非法`);
+      const qty = nullProto<Record<string, number>>();
+      for (const [pid, q] of Object.entries(rec.qty)) {
+        if (pid.trim() === '' || !isPosSafeInt(q)) throw bad(`退货单 ${retId} 存在非法退货明细`);
+        qty[pid] = q;
+      }
+      if (Object.keys(qty).length === 0) throw bad(`退货单 ${retId} 至少需要一种商品`);
+      const arr = store.arrivals[rec.arrId];
+      if (arr === undefined) throw bad(`退货单 ${retId} 指向的原到货单 ${rec.arrId} 不存在`);
+      if (rec.wh !== arr.wh) throw bad(`退货单 ${retId} 的仓库与原到货单 ${rec.arrId} 的收货仓不一致`);
+      for (const [pid, q] of Object.entries(qty)) {
+        if (arr.qty[pid] === undefined)
+          throw bad(`退货单 ${retId} 含原到货单 ${rec.arrId} 没有的商品 ${pid}`);
+        if (q > arr.qty[pid])
+          throw bad(`退货单 ${retId} 商品 ${pid} 退货量超过原到货量`);
+      }
+      store.returns[retId] = { arrId: rec.arrId, wh: rec.wh, qty, resultLines: rec.resultLines };
+    }
+  }
+
   // reversals 为新增字段：合法旧数据没有该字段，按空集合处理。
-  // 原单既可以是入库/出库/调拨/盘点单，也可以是到货单、取消单；冲销单不可冲销。
+  // 原单既可以是入库/出库/调拨/盘点单，也可以是到货单、取消单、退货单；冲销单不可冲销。
   if (data.reversals !== undefined) {
     if (!isPlainObject(data.reversals)) throw bad('reversals 不是对象');
     for (const [revId, rec] of Object.entries(data.reversals)) {
@@ -384,10 +443,12 @@ function validateStore(data: unknown): Store {
       if (store.docs[revId] !== undefined) throw bad(`冲销单编号 ${revId} 与原始库存单据编号冲突`);
       if (store.arrivals[revId] !== undefined) throw bad(`冲销单编号 ${revId} 与到货单编号冲突`);
       if (store.cancels[revId] !== undefined) throw bad(`冲销单编号 ${revId} 与取消单编号冲突`);
+      if (store.returns[revId] !== undefined) throw bad(`冲销单编号 ${revId} 与退货单编号冲突`);
       const origRec = store.docs[rec.orig];
       const origArr = store.arrivals[rec.orig];
       const origCan = store.cancels[rec.orig];
-      if (origRec === undefined && origArr === undefined && origCan === undefined) {
+      const origRet = store.returns[rec.orig];
+      if (origRec === undefined && origArr === undefined && origCan === undefined && origRet === undefined) {
         // 用 data.reversals 判定，避免依赖键的先后顺序（此时 store.reversals 可能尚未装全）
         if (isPlainObject((data.reversals as Record<string, unknown>)[rec.orig]))
           throw bad(`冲销单 ${rec.orig} 不可被再次冲销（冲销单不能冲销冲销单）`);
@@ -450,16 +511,73 @@ function validateStore(data: unknown): Store {
       throw bad(`冲销单 ${e.doc} 商品 ${e.product} 的冲销量与原到货单不一致`);
   }
 
-  // 冲销流水类型必须与原单业务类型一致（入库→in-rev、到货→arrival-rev 等）；
+  // 退货流水必须能找到所属退货单，且逐项数量/原到货单/采购单/仓库与记录一致
+  const returnEntrySeen = nullProto<Record<string, Record<string, number>>>();
+  for (const e of store.entries) {
+    if (e.type !== 'return') continue;
+    const ret = store.returns[e.doc];
+    if (ret === undefined) throw bad(`流水引用了不存在的退货单 ${e.doc}`);
+    if (e.arr !== ret.arrId) throw bad(`退货单 ${e.doc} 流水的原到货单编号与记录不一致`);
+    const arr = store.arrivals[ret.arrId];
+    if (arr === undefined) throw bad(`退货单 ${e.doc} 指向的原到货单 ${ret.arrId} 不存在`);
+    if (e.po !== arr.poId) throw bad(`退货单 ${e.doc} 流水的采购单编号与原到货单不一致`);
+    if (e.wh !== ret.wh) throw bad(`退货单 ${e.doc} 流水的仓库与记录不一致`);
+    const perProduct = (returnEntrySeen[e.doc] ??= nullProto<Record<string, number>>());
+    perProduct[e.product] = (perProduct[e.product] ?? 0) + e.qty!;
+  }
+  for (const [retId, ret] of Object.entries(store.returns)) {
+    const seen = returnEntrySeen[retId];
+    if (seen === undefined) throw bad(`退货单 ${retId} 缺少退货流水`);
+    for (const [pid, q] of Object.entries(ret.qty)) {
+      if (seen[pid] !== q) throw bad(`退货单 ${retId} 商品 ${pid} 的流水数量与记录不一致`);
+    }
+    for (const pid of Object.keys(seen)) {
+      if (ret.qty[pid] === undefined) throw bad(`退货单 ${retId} 的流水含记录中没有的商品 ${pid}`);
+    }
+  }
+
+  // 冲销退货流水逐项数量必须与原退货单一致
+  for (const e of store.entries) {
+    if (e.type !== 'return-rev') continue;
+    const rev = store.reversals[e.doc];
+    if (rev === undefined) throw bad(`冲销退货流水引用了不存在的冲销单 ${e.doc}`);
+    const ret = store.returns[rev.orig];
+    if (ret === undefined) throw bad(`冲销单 ${e.doc} 指向的退货原单 ${rev.orig} 不存在`);
+    if (e.arr !== ret.arrId) throw bad(`冲销单 ${e.doc} 流水的原到货单编号与原退货单不一致`);
+    const arr = store.arrivals[ret.arrId];
+    if (arr === undefined) throw bad(`冲销单 ${e.doc} 的原退货单 ${rev.orig} 指向的原到货单 ${ret.arrId} 不存在`);
+    if (e.po !== arr.poId) throw bad(`冲销单 ${e.doc} 流水的采购单编号与原到货单不一致`);
+    if (ret.qty[e.product] !== e.qty)
+      throw bad(`冲销单 ${e.doc} 商品 ${e.product} 的冲销量与原退货单不一致`);
+  }
+
+  // 退货完整性：任一原到货单的未冲销累计退货不得超过其到货量（超退为损坏数据）；
+  // 原到货单已冲销时其退货必须全部已冲销（有未冲销退货的到货单禁止冲销）
+  const reversedOrigIds = new Set(Object.values(store.reversals).map((r) => r.orig));
+  const openReturnedByArr = nullProto<Record<string, Record<string, number>>>();
+  for (const [retId, ret] of Object.entries(store.returns)) {
+    if (reversedOrigIds.has(retId)) continue; // 已冲销的退货不再计入
+    if (reversedOrigIds.has(ret.arrId))
+      throw bad(`到货单 ${ret.arrId} 已整单冲销，但其退货单 ${retId} 未冲销`);
+    const arr = store.arrivals[ret.arrId];
+    const perProduct = (openReturnedByArr[ret.arrId] ??= nullProto<Record<string, number>>());
+    for (const [pid, q] of Object.entries(ret.qty)) {
+      perProduct[pid] = (perProduct[pid] ?? 0) + q;
+      if (perProduct[pid] > arr.qty[pid])
+        throw bad(`原到货单 ${ret.arrId} 商品 ${pid} 的未冲销累计退货超过其到货量（超退）`);
+    }
+  }
+
+  // 冲销流水类型必须与原单业务类型一致（入库→in-rev、到货→arrival-rev、退货→return-rev 等）；
   // 取消单冲销不产生库存流水（取消本身不改库存），故不要求、也不允许携带流水。
   const revIdsWithEntries = nullProto<Record<string, boolean>>();
   for (const [revId, rev] of Object.entries(store.reversals)) {
     const origDoc = store.docs[rev.orig];
-    const isCancelOrig = origDoc === undefined && store.arrivals[rev.orig] === undefined;
-    // 原单为取消单时（前面已确认三者必居其一）不应存在任何冲销流水
+    // 原单为取消单时（前面已确认必为库存单/到货/取消/退货之一）不应存在任何冲销流水
     let expected: EntryType | undefined;
     if (origDoc !== undefined) expected = `${origDoc.content.type}-rev` as EntryType;
-    else if (!isCancelOrig) expected = 'arrival-rev';
+    else if (store.arrivals[rev.orig] !== undefined) expected = 'arrival-rev';
+    else if (store.returns[rev.orig] !== undefined) expected = 'return-rev';
     for (const e of store.entries) {
       if (e.doc !== revId) continue;
       if (expected === undefined)
@@ -474,25 +592,34 @@ function validateStore(data: unknown): Store {
     if (revIdsWithEntries[revId] === false) throw bad(`冲销单 ${revId} 缺少冲销流水`);
   }
 
-  // 采购进度不变量：任一商品“未冲销累计到货 + 未冲销累计取消”不得超过订购量
+  // 采购进度不变量：有效到货 = 未冲销到货 - 未冲销退货；任一商品
+  // “有效到货 + 未冲销累计取消”不得超过订购量
   // （待到货量 = 订购量 - 有效到货量 - 有效取消量，不得为负）。
   for (const [poId, po] of Object.entries(store.purchases)) {
     const arrived = nullProto<Record<string, number>>();
     for (const [arrId, arr] of Object.entries(store.arrivals)) {
       if (arr.poId !== poId) continue;
-      const isReversed = Object.values(store.reversals).some((r) => r.orig === arrId);
-      if (isReversed) continue; // 已整单冲销的到货不再计入有效到货
-      for (const [pid, q] of Object.entries(arr.qty)) {
-        arrived[pid] = (arrived[pid] ?? 0) + q;
-        if (arrived[pid] > po.ordered[pid])
-          throw bad(`采购单 ${poId} 商品 ${pid} 未冲销累计到货超过订购量`);
+      if (reversedOrigIds.has(arrId)) continue; // 已整单冲销的到货不再计入有效到货
+      for (const [pid, q] of Object.entries(arr.qty)) arrived[pid] = (arrived[pid] ?? 0) + q;
+    }
+    for (const [retId, ret] of Object.entries(store.returns)) {
+      if (reversedOrigIds.has(retId)) continue; // 已整单冲销的退货不再扣减有效到货
+      const arr = store.arrivals[ret.arrId];
+      if (arr.poId !== poId) continue;
+      for (const [pid, q] of Object.entries(ret.qty)) {
+        arrived[pid] = (arrived[pid] ?? 0) - q;
+        if (arrived[pid] < 0)
+          throw bad(`采购单 ${poId} 商品 ${pid} 未冲销累计退货超过未冲销累计到货（有效到货为负）`);
       }
+    }
+    for (const [pid, q] of Object.entries(arrived)) {
+      if (q > po.ordered[pid])
+        throw bad(`采购单 ${poId} 商品 ${pid} 有效到货（未冲销到货减未冲销退货）超过订购量`);
     }
     const cancelled = nullProto<Record<string, number>>();
     for (const [canId, can] of Object.entries(store.cancels)) {
       if (can.poId !== poId) continue;
-      const isReversed = Object.values(store.reversals).some((r) => r.orig === canId);
-      if (isReversed) continue; // 已整单冲销的取消不再计入有效取消
+      if (reversedOrigIds.has(canId)) continue; // 已整单冲销的取消不再计入有效取消
       for (const [pid, q] of Object.entries(can.qty)) {
         cancelled[pid] = (cancelled[pid] ?? 0) + q;
         if ((arrived[pid] ?? 0) + cancelled[pid] > po.ordered[pid])
@@ -668,6 +795,12 @@ interface CancelRequest {
   items: Map<string, number>; // 合并后的本次取消量
 }
 
+interface ReturnRequest {
+  retId: string;
+  arrId: string; // 原到货单编号
+  items: Map<string, number>; // 合并后的本次退货量
+}
+
 function parsePurchaseArgs(tokens: string[]): PurchaseRequest {
   const args = parseArgs(tokens, ['--supplier', '--wh'], ['--item']);
   const poRaw = args.positionals[0];
@@ -716,6 +849,21 @@ function parseCancelArgs(tokens: string[]): CancelRequest {
   return { canId: trimOrThrow('取消单编号', canRaw), poId: trimOrThrow('采购编号', args.flags['--po']), items };
 }
 
+function parseReturnArgs(tokens: string[]): ReturnRequest {
+  const args = parseArgs(tokens, ['--arrival'], ['--item']);
+  const retRaw = args.positionals[0];
+  if (retRaw === undefined || args.positionals.length !== 1)
+    throw new UsageError('用法：return <退货单编号> --arrival <原到货单编号> --item <商品编号:退货量> [...]');
+  if (args.flags['--arrival'] === undefined)
+    throw new UsageError('退货必须通过 --arrival <原到货单编号> 指定原到货单（采购与仓库取原到货）');
+
+  const items = new Map<string, number>();
+  for (const raw of args.multi['--item'] ?? []) parseItem(raw, items);
+  if (items.size === 0) throw new UsageError('退货单至少需要一条 --item 商品编号:退货量 明细');
+
+  return { retId: trimOrThrow('退货单编号', retRaw), arrId: trimOrThrow('原到货单编号', args.flags['--arrival']), items };
+}
+
 // ---------- 整批导入文件解析 ----------
 
 type ImportRequest =
@@ -724,7 +872,8 @@ type ImportRequest =
   | { kind: 'reverse'; docId: string; orig: string }
   | { kind: 'po'; req: PurchaseRequest }
   | { kind: 'arrival'; req: ArrivalRequest }
-  | { kind: 'cancel'; req: CancelRequest };
+  | { kind: 'cancel'; req: CancelRequest }
+  | { kind: 'return'; req: ReturnRequest };
 
 /** 读取导入文件：无法读取属于读写失败（退出 1），不改变任何已提交状态。 */
 function readImportFile(file: string): string {
@@ -872,8 +1021,15 @@ function parseImportFile(raw: string): ImportRequest[] {
         out.push({ kind: 'cancel', req: { canId, poId, items: parseQtyItems(item, i) } });
         break;
       }
+      case 'return': {
+        checkUnknown(item, ['type', 'id', 'arrival', 'items'], i);
+        const retId = requireString(item, 'id', '退货单编号', i);
+        const arrId = requireString(item, 'arrival', '原到货单编号', i);
+        out.push({ kind: 'return', req: { retId, arrId, items: parseQtyItems(item, i) } });
+        break;
+      }
       default:
-        throw at(i, `不支持的业务类型 "${String(item.type)}"，只允许 in、out、transfer、count、reverse、po、arrival、cancel`);
+        throw at(i, `不支持的业务类型 "${String(item.type)}"，只允许 in、out、transfer、count、reverse、po、arrival、cancel、return`);
     }
   });
 
@@ -967,12 +1123,14 @@ class Ledger {
   private readonly pos: Record<string, PurchaseRecord> = nullProto();
   private readonly arrivals: Record<string, ArrivalRecord> = nullProto();
   private readonly cancels: Record<string, CancelRecord> = nullProto();
+  private readonly returns: Record<string, ReturnRecord> = nullProto();
   private readonly reversedOrigs = new Set<string>();
   private readonly newDocIds: string[] = [];
   private readonly newRevIds: string[] = [];
   private readonly newPoIds: string[] = [];
   private readonly newArrivalIds: string[] = [];
   private readonly newCancelIds: string[] = [];
+  private readonly newReturnIds: string[] = [];
 
   constructor(store: Store) {
     this.base = store;
@@ -986,6 +1144,7 @@ class Ledger {
     for (const [id, rec] of Object.entries(store.purchases)) this.pos[id] = rec;
     for (const [id, rec] of Object.entries(store.arrivals)) this.arrivals[id] = rec;
     for (const [id, rec] of Object.entries(store.cancels)) this.cancels[id] = rec;
+    for (const [id, rec] of Object.entries(store.returns)) this.returns[id] = rec;
   }
 
   /** 是否有新生效单据：无新单据（全部重复）时 commit 不改写数据。 */
@@ -995,7 +1154,8 @@ class Ledger {
       this.newRevIds.length +
       this.newPoIds.length +
       this.newArrivalIds.length +
-      this.newCancelIds.length > 0
+      this.newCancelIds.length +
+      this.newReturnIds.length > 0
     );
   }
 
@@ -1022,6 +1182,12 @@ class Ledger {
       const n = Object.keys(origCan.qty).length;
       return `冲销单 ${revId} 提交成功，冲销取消原单 ${rec.orig}（采购单 ${origCan.poId}），共 ${n} 种商品：`;
     }
+    const origRet = this.returns[rec.orig];
+    if (origRet !== undefined) {
+      const arr = this.arrivals[origRet.arrId];
+      const n = Object.keys(origRet.qty).length;
+      return `冲销单 ${revId} 提交成功，冲销退货原单 ${rec.orig}（原到货单 ${origRet.arrId}，采购单 ${arr.poId}），共 ${n} 种商品：`;
+    }
     // 原单为到货单（能进入去重视图的冲销单必然指向存在的原单）
     const arr = this.arrivals[rec.orig];
     const n = Object.keys(arr.qty).length;
@@ -1036,14 +1202,37 @@ class Ledger {
     return this.base.arrivals[arrId] !== undefined ? 'store' : 'batch';
   }
 
-  /** 计算某采购单各商品当前“未冲销累计到货”（仅计入尚未被整单冲销的到货单）。 */
+  private repeatedReturnSource(retId: string): 'store' | 'batch' {
+    return this.base.returns[retId] !== undefined ? 'store' : 'batch';
+  }
+
+  /**
+   * 计算某采购单各商品当前“有效到货”：未冲销累计到货减去未冲销累计退货。
+   * 新增到货、取消与退货冲销的进度校验均按此口径。
+   */
   private effectiveArrived(poId: string): Record<string, number> {
     const arrived = nullProto<Record<string, number>>();
     for (const [arrId, arr] of Object.entries(this.arrivals)) {
       if (arr.poId !== poId || this.reversedOrigs.has(arrId)) continue;
       for (const [pid, q] of Object.entries(arr.qty)) arrived[pid] = (arrived[pid] ?? 0) + q;
     }
+    for (const [retId, ret] of Object.entries(this.returns)) {
+      if (this.reversedOrigs.has(retId)) continue; // 已冲销的退货不再扣减
+      const arr = this.arrivals[ret.arrId];
+      if (arr.poId !== poId) continue;
+      for (const [pid, q] of Object.entries(ret.qty)) arrived[pid] = (arrived[pid] ?? 0) - q;
+    }
     return arrived;
+  }
+
+  /** 计算某原到货单各商品当前“关联未冲销累计退货”（仅计入尚未被整单冲销的退货单）。 */
+  private effectiveReturned(arrId: string): Record<string, number> {
+    const returned = nullProto<Record<string, number>>();
+    for (const [retId, ret] of Object.entries(this.returns)) {
+      if (ret.arrId !== arrId || this.reversedOrigs.has(retId)) continue;
+      for (const [pid, q] of Object.entries(ret.qty)) returned[pid] = (returned[pid] ?? 0) + q;
+    }
+    return returned;
   }
 
   /** 计算某采购单各商品当前“未冲销累计取消”（仅计入尚未被整单冲销的取消单）。 */
@@ -1131,6 +1320,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.arrId} 已用于冲销单，拒绝提交`);
     if (this.cancels[req.arrId] !== undefined)
       throw new BizError(`单据编号 ${req.arrId} 已用于取消单，拒绝提交`);
+    if (this.returns[req.arrId] !== undefined)
+      throw new BizError(`单据编号 ${req.arrId} 已用于退货单，拒绝提交`);
 
     const po = this.pos[req.poId];
     if (po === undefined) throw new BizError(`采购单 ${req.poId} 不存在，拒绝到货`);
@@ -1227,6 +1418,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.canId} 已用于到货单，拒绝提交`);
     if (this.revs[req.canId] !== undefined)
       throw new BizError(`单据编号 ${req.canId} 已用于冲销单，拒绝提交`);
+    if (this.returns[req.canId] !== undefined)
+      throw new BizError(`单据编号 ${req.canId} 已用于退货单，拒绝提交`);
 
     const po = this.pos[req.poId];
     if (po === undefined) throw new BizError(`采购单 ${req.poId} 不存在，拒绝取消`);
@@ -1275,6 +1468,104 @@ class Ledger {
     return `取消单 ${canId} 提交成功，采购单 ${rec.poId}，共 ${Object.keys(rec.qty).length} 种商品（只减少待收承诺，不改库存与流水）：`;
   }
 
+  /**
+   * 采购退货：独立退货单编号，引用一张已成功且未冲销的原到货单，只退其明细内商品；
+   * 采购单与退货仓均取原到货（原收货仓）。各商品本次退货量不得超过
+   * “原到货量 - 关联未冲销退货量”，并从原收货仓当前余量扣减；
+   * 超退、缺货或任一明细非法整单拒绝、不占用退货单编号。
+   * 退货不改订购与取消：有效到货 = 未冲销到货 - 未冲销退货，待到货相应回升。
+   * 退货单与入库/出库/调拨/盘点/到货/取消/冲销单共用唯一编号空间；
+   * 同号同原到货同合并数量重放只返回原结果——即使进度已变化、退货或原到货
+   * 已冲销也不再校验、不再生效。
+   */
+  applyReturn(req: ReturnRequest): ApplyOutcome {
+    const existed = this.returns[req.retId];
+    if (existed !== undefined) {
+      if (
+        existed.arrId !== req.arrId ||
+        stableStringify(existed.qty) !== stableStringify(canonicalArrivalItems(req.items))
+      )
+        throw new BizError(`退货单编号 ${req.retId} 已用于内容不同的单据，拒绝提交`);
+      return {
+        duplicate: true,
+        header: this.returnHeader(req.retId, existed),
+        lines: existed.resultLines,
+        repeatedFrom: this.repeatedReturnSource(req.retId),
+      };
+    }
+    // 与入库/出库/调拨/盘点/到货/取消/冲销单共用唯一编号空间（采购单编号空间独立，不在此列）
+    if (this.docs[req.retId] !== undefined)
+      throw new BizError(`单据编号 ${req.retId} 已用于入库/出库/调拨/盘点单，拒绝提交`);
+    if (this.arrivals[req.retId] !== undefined)
+      throw new BizError(`单据编号 ${req.retId} 已用于到货单，拒绝提交`);
+    if (this.cancels[req.retId] !== undefined)
+      throw new BizError(`单据编号 ${req.retId} 已用于取消单，拒绝提交`);
+    if (this.revs[req.retId] !== undefined)
+      throw new BizError(`单据编号 ${req.retId} 已用于冲销单，拒绝提交`);
+
+    const arr = this.arrivals[req.arrId];
+    if (arr === undefined) throw new BizError(`原到货单 ${req.arrId} 不存在或尚未在本列表中出现，拒绝退货`);
+    if (this.reversedOrigs.has(req.arrId))
+      throw new BizError(`原到货单 ${req.arrId} 已整单冲销，不能对其退货，拒绝整单`);
+
+    const wh = arr.wh; // 采购与仓库取原到货：退货从原收货仓扣减
+    const poId = arr.poId;
+    const po = this.pos[poId];
+    const returnedBefore = this.effectiveReturned(req.arrId); // 关联未冲销累计退货
+    const pids = [...req.items.keys()].sort();
+
+    // 先整单校验：只能退原到货明细商品；本次量 ≤ 原到货量 - 关联未冲销退货量；当前余量充足
+    for (const pid of pids) {
+      const qty = req.items.get(pid)!;
+      const origQty = arr.qty[pid];
+      if (origQty === undefined)
+        throw new BizError(`商品 ${pid} 不在原到货单 ${req.arrId} 的明细内，拒绝整单`);
+      const returned = returnedBefore[pid] ?? 0;
+      if (qty > origQty - returned)
+        throw new BizError(
+          `商品 ${pid} 退货超量：原到货 ${origQty}，关联未冲销退货 ${returned}，` +
+            `可退 ${origQty - returned}，本次 ${qty}，拒绝整单`,
+        );
+      const before = getStock(this.draft, pid, wh);
+      if (before < qty)
+        throw new BizError(
+          `商品 ${pid} 原收货仓 ${wh} 当前余量 ${before} 不足退货扣减 ${qty}，拒绝整单`,
+        );
+    }
+
+    const arrivedBefore = this.effectiveArrived(poId); // 有效到货（未冲销到货减未冲销退货，含本次前）
+    const cancelled = this.effectiveCancelled(poId); // 未冲销累计取消
+    const qtyRecord: Record<string, number> = nullProto();
+    const reportLines: string[] = [];
+    for (const pid of pids) {
+      const qty = req.items.get(pid)!;
+      const before = getStock(this.draft, pid, wh);
+      const after = before - qty;
+      setStock(this.draft, pid, wh, after);
+      this.additions.push({
+        seq: ++this.seq, doc: req.retId, type: 'return', product: pid, wh,
+        qty, before, after, po: poId, arr: req.arrId,
+      });
+      // 退货后有效到货 = 原有效到货 - 本次退货；待到货相应回升
+      const effAfter = (arrivedBefore[pid] ?? 0) - qty;
+      const remaining = po.ordered[pid] - effAfter - (cancelled[pid] ?? 0);
+      qtyRecord[pid] = qty;
+      reportLines.push(
+        `退货 ${pid} @${wh} -${qty}：库存 ${before} -> ${after}；有效到货降至 ${effAfter}/${po.ordered[pid]}，待到货 ${remaining}`,
+      );
+    }
+
+    this.returns[req.retId] = { arrId: req.arrId, wh, qty: qtyRecord, resultLines: reportLines };
+    this.newReturnIds.push(req.retId);
+
+    return { duplicate: false, header: this.returnHeader(req.retId, this.returns[req.retId]), lines: reportLines };
+  }
+
+  private returnHeader(retId: string, rec: ReturnRecord): string {
+    const arr = this.arrivals[rec.arrId];
+    return `退货单 ${retId} 提交成功，原到货单 ${rec.arrId}（采购单 ${arr.poId}），退货仓 ${rec.wh}，共 ${Object.keys(rec.qty).length} 种商品：`;
+  }
+
   private repeatedRevSource(revId: string): 'store' | 'batch' {
     return this.base.reversals[revId] !== undefined ? 'store' : 'batch';
   }
@@ -1292,13 +1583,15 @@ class Ledger {
         throw new BizError(`单据编号 ${req.docId} 已用于业务内容不同的单据，拒绝提交`);
       return { duplicate: true, header: this.docHeader(req.docId, existed), lines: existed.resultLines, repeatedFrom: this.repeatedDocSource(req.docId) };
     }
-    // 编号空间与出库/入库/调拨/盘点/到货/取消/冲销单共用
+    // 编号空间与出库/入库/调拨/盘点/到货/取消/退货/冲销单共用
     if (this.revs[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于冲销单，拒绝提交`);
     if (this.arrivals[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于到货单，拒绝提交`);
     if (this.cancels[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于取消单，拒绝提交`);
+    if (this.returns[req.docId] !== undefined)
+      throw new BizError(`单据编号 ${req.docId} 已用于退货单，拒绝提交`);
 
     for (const pid of req.items.keys()) {
       if (this.base.products[pid] === undefined) throw new BizError(`商品未登记，拒绝整单：${pid}`);
@@ -1375,13 +1668,15 @@ class Ledger {
         throw new BizError(`单据编号 ${req.docId} 已用于业务内容不同的单据，拒绝提交`);
       return { duplicate: true, header: this.docHeader(req.docId, existed), lines: existed.resultLines, repeatedFrom: this.repeatedDocSource(req.docId) };
     }
-    // 编号空间与入库/出库/调拨/到货/取消/冲销单共用
+    // 编号空间与入库/出库/调拨/到货/取消/退货/冲销单共用
     if (this.revs[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于冲销单，拒绝提交`);
     if (this.arrivals[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于到货单，拒绝提交`);
     if (this.cancels[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于取消单，拒绝提交`);
+    if (this.returns[req.docId] !== undefined)
+      throw new BizError(`单据编号 ${req.docId} 已用于退货单，拒绝提交`);
 
     const pids = [...req.items.keys()].sort();
     for (const pid of pids) {
@@ -1437,13 +1732,15 @@ class Ledger {
         );
       return { duplicate: true, header: this.revHeader(revId, existed), lines: existed.resultLines, repeatedFrom: this.repeatedRevSource(revId) };
     }
-    // 冲销单与入库/出库/调拨/盘点/到货/取消共用唯一编号空间
+    // 冲销单与入库/出库/调拨/盘点/到货/取消/退货共用唯一编号空间
     if (this.docs[revId] !== undefined)
       throw new BizError(`编号 ${revId} 已是入库/出库/调拨/盘点单编号，不能用作冲销单，拒绝提交`);
     if (this.arrivals[revId] !== undefined)
       throw new BizError(`编号 ${revId} 已是到货单编号，不能用作冲销单，拒绝提交`);
     if (this.cancels[revId] !== undefined)
       throw new BizError(`编号 ${revId} 已是取消单编号，不能用作冲销单，拒绝提交`);
+    if (this.returns[revId] !== undefined)
+      throw new BizError(`编号 ${revId} 已是退货单编号，不能用作冲销单，拒绝提交`);
 
     // 到货原单：整单冲销到货——从当前收货仓扣回原数量并减少有效到货量，
     // 收齐采购重新待收；不撤销后续业务。到货冲销与库存单冲销分开处理。
@@ -1454,6 +1751,11 @@ class Ledger {
     // 不改库存、不产生库存流水，也不撤销后续业务。
     const origCan = this.cancels[origId];
     if (origCan !== undefined) return this.applyCancelReversal(revId, origId, origCan);
+
+    // 退货原单：整单冲销退货——向原收货仓当前余量补回原退货量、恢复有效到货；
+    // 不撤销后续业务。
+    const origRet = this.returns[origId];
+    if (origRet !== undefined) return this.applyReturnReversal(revId, origId, origRet);
 
     // 只能冲销成功的原始库存单据：不存在（含列表中尚未出现）的原单、冲销单本身均不可冲销
     const origRec = this.docs[origId];
@@ -1590,6 +1892,7 @@ class Ledger {
    * 有效到货中剔除（采购单相应数量重新待收）；不回滚、不撤销其后发生的其他业务。
    * 任一商品当前余量不足扣回则整单拒绝，不改进度、不登记冲销关系，同号可重试。
    * 每张到货单最多冲销一次；冲销单本身不可冲销。
+   * 有未冲销退货的到货单禁止冲销；相关退货全部冲销后可按原规则冲销。
    */
   private applyArrivalReversal(revId: string, origId: string, origArr: ArrivalRecord): ApplyOutcome {
     if (this.reversedOrigs.has(origId)) {
@@ -1602,6 +1905,17 @@ class Ledger {
       }
       throw new BizError(`到货原单 ${origId} 已被冲销单 ${existingRev} 成功冲销，每张到货单只能冲销一次`);
     }
+
+    // 有未冲销退货的到货单禁止冲销：须先把关联退货全部冲销
+    const openReturns = Object.entries(this.returns)
+      .filter(([retId, ret]) => ret.arrId === origId && !this.reversedOrigs.has(retId))
+      .map(([retId]) => retId)
+      .sort();
+    if (openReturns.length > 0)
+      throw new BizError(
+        `到货单 ${origId} 存在未冲销退货（${openReturns.join('、')}），禁止冲销；` +
+          `相关退货全部冲销后可按原规则冲销该到货单`,
+      );
 
     const poId = origArr.poId;
     const wh = origArr.wh;
@@ -1697,7 +2011,81 @@ class Ledger {
   }
 
   /**
-   * 统一提交：把草稿余量、新增流水、新单据去重记录、采购单、到货单、取消单与
+   * 整单冲销退货：向原收货仓的“当前余量”补回原退货数量，并把该退货单从
+   * 有效退货中剔除（有效到货相应恢复）；不撤销其后发生的其他业务。
+   * 任一商品补回后余量溢出，或恢复后“有效到货 + 有效取消”超过订购量，整单拒绝、
+   * 不改进度、不登记冲销关系，同号可重试。每张退货单最多冲销一次；冲销单不可冲销。
+   */
+  private applyReturnReversal(revId: string, origId: string, origRet: ReturnRecord): ApplyOutcome {
+    if (this.reversedOrigs.has(origId)) {
+      let existingRev = '';
+      for (const [r, rec] of Object.entries(this.revs)) {
+        if (rec.orig === origId) {
+          existingRev = r;
+          break;
+        }
+      }
+      throw new BizError(`退货原单 ${origId} 已被冲销单 ${existingRev} 成功冲销，每张退货单只能冲销一次`);
+    }
+
+    const arr = this.arrivals[origRet.arrId];
+    const poId = arr.poId;
+    const po = this.pos[poId];
+    const wh = origRet.wh;
+    const pids = Object.keys(origRet.qty).sort();
+    const arrivedBefore = this.effectiveArrived(poId); // 含本退货的扣减：其尚未被冲销，仍计入有效退货
+    const cancelled = this.effectiveCancelled(poId); // 未冲销累计取消
+
+    // 先整单校验：补回不溢出；恢复后 有效到货 + 有效取消 不得超过订购量
+    for (const pid of pids) {
+      const qty = origRet.qty[pid];
+      const before = getStock(this.draft, pid, wh);
+      const after = before + qty;
+      if (after > MAX_SAFE)
+        throw new BizError(
+          `冲销退货原单 ${origId}：商品 ${pid} 原收货仓 ${wh} 补回后余量超出安全整数范围，拒绝整单`,
+        );
+      const effAfter = (arrivedBefore[pid] ?? 0) + qty;
+      if (effAfter + (cancelled[pid] ?? 0) > po.ordered[pid])
+        throw new BizError(
+          `冲销退货原单 ${origId}：商品 ${pid} 恢复后有效到货 ${effAfter} 与有效取消 ` +
+            `${cancelled[pid] ?? 0} 合计超过订购 ${po.ordered[pid]}，拒绝整单`,
+        );
+    }
+
+    const reportLines: string[] = [];
+    for (const pid of pids) {
+      const qty = origRet.qty[pid];
+      const before = getStock(this.draft, pid, wh);
+      const after = before + qty;
+      setStock(this.draft, pid, wh, after);
+      this.additions.push({
+        seq: ++this.seq, doc: revId, type: 'return-rev', product: pid, wh,
+        qty, before, after, po: poId, arr: origRet.arrId, orig: origId,
+      });
+      // 冲销后有效到货 = 原有效到货 + 本单退货量；待到货相应回落
+      const effAfter = (arrivedBefore[pid] ?? 0) + qty;
+      const remainingAfter = po.ordered[pid] - effAfter - (cancelled[pid] ?? 0);
+      reportLines.push(
+        `冲销退货 原单=${origId} 原到货单=${origRet.arrId} 采购单=${poId} 商品=${pid} @${wh} +${qty}：` +
+          `${before} -> ${after}；有效到货回升至 ${effAfter}/${po.ordered[pid]}，待到货 ${remainingAfter}`,
+      );
+    }
+
+    // 全部商品补回成功：登记冲销关系（该退货单自此不再扣减有效到货）；由 commit 一次性落库
+    this.revs[revId] = { orig: origId, resultLines: reportLines };
+    this.newRevIds.push(revId);
+    this.reversedOrigs.add(origId);
+
+    return {
+      duplicate: false,
+      header: `冲销单 ${revId} 提交成功，冲销退货原单 ${origId}（原到货单 ${origRet.arrId}，采购单 ${poId}），共 ${pids.length} 种商品：`,
+      lines: reportLines,
+    };
+  }
+
+  /**
+   * 统一提交：把草稿余量、新增流水、新单据去重记录、采购单、到货单、取消单、退货单与
    * 冲销关系写回 base 并原子保存。全部项均为重复时不写回、不保存（不改写数据）。
    */
   commit(dataDir: string): void {
@@ -1709,6 +2097,7 @@ class Ledger {
     for (const id of this.newPoIds) this.base.purchases[id] = this.pos[id];
     for (const id of this.newArrivalIds) this.base.arrivals[id] = this.arrivals[id];
     for (const id of this.newCancelIds) this.base.cancels[id] = this.cancels[id];
+    for (const id of this.newReturnIds) this.base.returns[id] = this.returns[id];
     saveStore(dataDir, this.base);
   }
 }
@@ -1780,11 +2169,13 @@ const TYPE_LABEL: Record<EntryType, string> = {
   transfer: '调拨',
   count: '盘点',
   arrival: '到货',
+  return: '退货',
   'in-rev': '冲销入库',
   'out-rev': '冲销出库',
   'transfer-rev': '冲销调拨',
   'count-rev': '冲销盘点',
   'arrival-rev': '冲销到货',
+  'return-rev': '冲销退货',
 };
 
 function formatEntry(e: LedgerEntry): string {
@@ -1796,15 +2187,16 @@ function formatEntry(e: LedgerEntry): string {
       `\t差额=${fmtSigned(applied)}\t${e.before}->${e.after}\t账面=${e.expected}\t实盘=${e.actual}`;
   } else {
     let signed: string;
-    // 符号必须与前后余量一致：入库/冲销出库/到货/调入方向为增，其余为减
+    // 符号必须与前后余量一致：入库/冲销出库/到货/冲销退货/调入方向为增，其余为减
     const increases =
-      e.type === 'in' || e.type === 'out-rev' || e.type === 'arrival' ||
+      e.type === 'in' || e.type === 'out-rev' || e.type === 'arrival' || e.type === 'return-rev' ||
       ((e.type === 'transfer' || e.type === 'transfer-rev') &&
         (e.type === 'transfer') === (e.wh === e.to));
     signed = `${increases ? '+' : '-'}${e.qty}`;
     line = `#${e.seq}\t单据=${e.doc}\t${TYPE_LABEL[e.type]}\t商品=${e.product}\t仓库=${e.wh}\t${signed}\t${e.before}->${e.after}`;
     if (e.type === 'transfer' || e.type === 'transfer-rev') line += `\t调拨=${e.from}->${e.to}`;
     if (e.po !== undefined) line += `\t采购单=${e.po}`;
+    if (e.arr !== undefined) line += `\t原到货单=${e.arr}`;
   }
   if (e.orig !== undefined) line += `\t原单=${e.orig}`;
   return line;
@@ -1863,24 +2255,32 @@ function runReverse(rest: string[], dataDir: string, store: Store): void {
   for (const line of outcome.lines) console.log(line);
 }
 
-/** 计算采购单各商品的有效（未冲销）到货量、有效（未冲销）取消量与待到货量。 */
+/** 计算采购单各商品的有效到货量（未冲销到货减未冲销退货）、有效退货量、有效取消量与待到货量。 */
 function purchaseProgress(store: Store, poId: string): {
   effective: Record<string, number>;
+  returned: Record<string, number>;
   cancelled: Record<string, number>;
   remaining: Record<string, number>;
 } {
+  const reversedOrigIds = new Set(Object.values(store.reversals).map((r) => r.orig));
   const effective = nullProto<Record<string, number>>();
   for (const [arrId, arr] of Object.entries(store.arrivals)) {
-    if (arr.poId !== poId) continue;
-    const isReversed = Object.values(store.reversals).some((r) => r.orig === arrId);
-    if (isReversed) continue;
+    if (arr.poId !== poId || reversedOrigIds.has(arrId)) continue;
     for (const [pid, q] of Object.entries(arr.qty)) effective[pid] = (effective[pid] ?? 0) + q;
+  }
+  const returned = nullProto<Record<string, number>>();
+  for (const [retId, ret] of Object.entries(store.returns)) {
+    if (reversedOrigIds.has(retId)) continue;
+    const arr = store.arrivals[ret.arrId];
+    if (arr.poId !== poId) continue;
+    for (const [pid, q] of Object.entries(ret.qty)) {
+      returned[pid] = (returned[pid] ?? 0) + q;
+      effective[pid] = (effective[pid] ?? 0) - q;
+    }
   }
   const cancelled = nullProto<Record<string, number>>();
   for (const [canId, can] of Object.entries(store.cancels)) {
-    if (can.poId !== poId) continue;
-    const isReversed = Object.values(store.reversals).some((r) => r.orig === canId);
-    if (isReversed) continue;
+    if (can.poId !== poId || reversedOrigIds.has(canId)) continue;
     for (const [pid, q] of Object.entries(can.qty)) cancelled[pid] = (cancelled[pid] ?? 0) + q;
   }
   const po = store.purchases[poId];
@@ -1888,7 +2288,7 @@ function purchaseProgress(store: Store, poId: string): {
   for (const [pid, ordered] of Object.entries(po.ordered)) {
     remaining[pid] = ordered - (effective[pid] ?? 0) - (cancelled[pid] ?? 0);
   }
-  return { effective, cancelled, remaining };
+  return { effective, returned, cancelled, remaining };
 }
 
 /**
@@ -1908,29 +2308,35 @@ function poStatus(ordered: number, effective: number, cancelled = 0): string {
 }
 
 function printPurchase(store: Store, poId: string, po: PurchaseRecord): void {
-  const { effective, cancelled, remaining } = purchaseProgress(store, poId);
+  const { effective, returned, cancelled, remaining } = purchaseProgress(store, poId);
   // 该采购单是否存在取消记录（含已冲销）：无取消的采购单展示行为保持不变
   const cancelIds = Object.keys(store.cancels)
     .filter((id) => store.cancels[id].poId === poId)
     .sort();
   const hasCancels = cancelIds.length > 0;
+  // 该采购单是否存在退货记录（含已冲销）：无退货的采购单展示行为保持不变
+  const returnIds = Object.keys(store.returns)
+    .filter((id) => store.arrivals[store.returns[id].arrId]?.poId === poId)
+    .sort();
+  const hasReturns = returnIds.length > 0;
 
   console.log(`采购单 ${poId}：供应商 ${po.supplier}，收货仓 ${po.wh}，共 ${Object.keys(po.ordered).length} 种商品`);
-  if (hasCancels) {
-    console.log('商品\t订购\t有效到货\t有效取消\t待到货\t状态');
-  } else {
-    console.log('商品\t订购\t有效到货\t待到货\t状态');
-  }
+  const cols = ['商品', '订购', '有效到货'];
+  if (hasReturns) cols.push('有效退货');
+  if (hasCancels) cols.push('有效取消');
+  cols.push('待到货', '状态');
+  console.log(cols.join('\t'));
   for (const pid of Object.keys(po.ordered).sort()) {
     const ordered = po.ordered[pid];
     const got = effective[pid] ?? 0;
+    const ret = returned[pid] ?? 0;
     const can = cancelled[pid] ?? 0;
     const wait = remaining[pid];
-    if (hasCancels) {
-      console.log(`${pid}\t${ordered}\t${got}\t${can}\t${wait}\t${poStatus(ordered, got, can)}`);
-    } else {
-      console.log(`${pid}\t${ordered}\t${got}\t${wait}\t${poStatus(ordered, got)}`);
-    }
+    const row = [pid, String(ordered), String(got)];
+    if (hasReturns) row.push(String(ret));
+    if (hasCancels) row.push(String(can));
+    row.push(String(wait), poStatus(ordered, got, can));
+    console.log(row.join('\t'));
   }
 
   // 到货/冲销关联
@@ -1986,6 +2392,32 @@ function printPurchase(store: Store, poId: string, po: PurchaseRecord): void {
     }
     console.log('取消记录：');
     for (const l of cancelLinks) console.log(`  ${l}`);
+  }
+
+  // 退货/冲销关联（仅存在退货记录时展示；退货扣减有效到货、相应数量重新待收）
+  if (hasReturns) {
+    const returnLinks: string[] = [];
+    for (const retId of returnIds) {
+      const ret = store.returns[retId];
+      let revId = '';
+      for (const [r, rec] of Object.entries(store.reversals)) {
+        if (rec.orig === retId) {
+          revId = r;
+          break;
+        }
+      }
+      const detail = Object.keys(ret.qty)
+        .sort()
+        .map((pid) => `${pid} x${ret.qty[pid]}`)
+        .join('，');
+      returnLinks.push(
+        revId === ''
+          ? `退货单 ${retId}（有效）：原到货单 ${ret.arrId}，${detail}`
+          : `退货单 ${retId}（已由冲销单 ${revId} 整单冲销，不再扣减有效到货）：原到货单 ${ret.arrId}，${detail}`,
+      );
+    }
+    console.log('退货记录：');
+    for (const l of returnLinks) console.log(`  ${l}`);
   }
 }
 
@@ -2068,6 +2500,19 @@ function runCancel(rest: string[], dataDir: string, store: Store): void {
   for (const line of outcome.lines) console.log(line);
 }
 
+function runReturn(rest: string[], dataDir: string, store: Store): void {
+  const req = parseReturnArgs(rest);
+  const ledger = new Ledger(store);
+  const outcome = ledger.applyReturn(req);
+  ledger.commit(dataDir);
+  if (outcome.duplicate) {
+    console.log(`退货单 ${req.retId} 为重复提交，原到货单与合并数量与原提交一致，返回原退货结果（库存、进度与流水不再变动）：`);
+  } else {
+    console.log(outcome.header);
+  }
+  for (const line of outcome.lines) console.log(line);
+}
+
 /**
  * 整批导入：按列表顺序在同一份草稿上处理各项，后项可见前项生效结果；
  * 任一项失败整批拒绝（此前已保存的单据不撤销，本批任何变动均不落库）。
@@ -2100,6 +2545,7 @@ function runImport(rest: string[], dataDir: string): void {
         case 'po': return ledger.applyPurchase(r.req);
         case 'arrival': return ledger.applyArrival(r.req);
         case 'cancel': return ledger.applyCancel(r.req);
+        case 'return': return ledger.applyReturn(r.req);
       }
     };
     let outcome: ApplyOutcome;
@@ -2114,6 +2560,7 @@ function runImport(rest: string[], dataDir: string): void {
       : r.kind === 'po' ? r.req.poId
       : r.kind === 'arrival' ? r.req.arrId
       : r.kind === 'cancel' ? r.req.canId
+      : r.kind === 'return' ? r.req.retId
       : r.req.docId;
 
     let status: string;
@@ -2161,7 +2608,9 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
         --item <编号:到货量> [...]                         采购分批到货入收货仓（可分次、可部分）
   cancel <取消单编号> --po <采购编号> \\
         --item <编号:取消量> [...]                         取消未到货数量（只减少待收承诺，不改库存）
-  reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点/到货/取消单
+  return <退货单编号> --arrival <原到货单编号> \\
+        --item <编号:退货量> [...]                         采购退货（从原收货仓扣减，退回后等待补收）
+  reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点/到货/取消/退货单
   import --file <单据列表.json>              整批导入有序单据列表（按顺序生效，整批成败一致）
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
@@ -2170,10 +2619,10 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
 
 规则：
   数量必须为正安全整数；同单同商品的重复明细先合并，再做足量与溢出校验；
-  任一明细不合法则整单拒绝。入库/出库/调拨/盘点/到货/取消/冲销单据编号在同一数据
+  任一明细不合法则整单拒绝。入库/出库/调拨/盘点/到货/取消/退货/冲销单据编号在同一数据
   目录内共用全局唯一编号空间，相同内容重复提交返回原结果且不重复变动，同编号不
   同内容或不同业务拒绝；失败提交不占用编号。采购编号独立于库存单据编号空间，
-  允许与库存/到货/取消/冲销单同名。所有标识与名称去首尾空白后非空、区分大小写。
+  允许与库存/到货/取消/退货/冲销单同名。所有标识与名称去首尾空白后非空、区分大小写。
 
 采购与到货规则：
   po register 登记采购单（编号、供应商、收货仓及至少一种已登记商品的订购量），
@@ -2193,9 +2642,17 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   承诺，不改原订购内容、库存或库存流水。同号同采购同合并数量重放返回原结果，
   即使进度已变化或该取消已冲销也不重新校验、不再生效；同号不同内容或不同业务
   拒绝。
-  po show 显示供应商、收货仓、各商品订购/有效到货/有效取消/待到货量及仍待收、
-  收齐、已结清状态（取消不计作到货、不会误报收齐），并列出到货单、取消单与
-  冲销单关联；flow 可凭采购单编号追溯到货与冲销到货流水。
+  return 以独立退货单编号引用一张已成功且未冲销的原到货单（采购与仓库取原到
+  货），只退原到货明细内商品：退货量为正安全整数、同商品先合并（合并溢出拒
+  绝），各商品本次量不得超过“原到货量 - 关联未冲销退货量”，并从原收货仓当
+  前余量扣减；超退、缺货或任一明细非法整单拒绝、不占用退货编号。退货不改订
+  购与取消：有效到货 = 未冲销到货 - 未冲销退货，待到货 = 订购 - 有效到货 -
+  有效取消，退回后相应数量等待补收；新增到货、取消均按此口径校验。同号同原
+  到货同合并数量重放返回原结果，即使进度已变化、退货或原到货已冲销也不重新
+  校验、不再生效；同号不同内容或不同业务拒绝。
+  po show 显示供应商、收货仓、各商品订购/有效到货/有效退货/有效取消/待到货量
+  及仍待收、收齐、已结清状态（取消不计作到货、不会误报收齐），并列出到货单、
+  取消单、退货单与冲销单关联；flow 可凭采购单编号追溯到货、退货与冲销流水。
 
 冲销规则：
   冲销在“当前余量”上应用原单的相反变动，不回滚原单之后的其他业务、不恢复绝对
@@ -2203,22 +2660,25 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   回并向原调出仓补回；冲销盘点在当前余量上减去原盘点差额（零差额不改余量，
   但仍记录冲销关系与流水）；冲销到货从采购单收货仓扣回原数量并减少有效到货量，
   已收齐的采购相应数量重新待收（不撤掉取消）；冲销取消移除该取消单的有效取消
-  量、恢复相应待收量，不改库存、不产生库存流水。数量取原单合并后的明细。任一
-  商品扣回不足、补回后溢出或冲减后为负则整单拒绝、不占用冲销单编号、原单不标
-  记冲销，条件改善后可重试。
-  只能冲销成功的原始库存单据、到货单与取消单；原单不存在、采购单、冲销单本身、
-  已冲销过的原单均不能再次冲销，每张原单最多冲销一次。冲销成功后重放原单（含
-  到货单、取消单）仍只返回其最初结果，不会重新生效；重放冲销单返回原冲销结果，
-  不再变动，同编号改指其他原单则拒绝。
+  量、恢复相应待收量，不改库存、不产生库存流水；冲销退货向原收货仓补回原退货
+  量、恢复有效到货，不撤销后续业务。数量取原单合并后的明细。任一商品扣回不足、
+  补回后溢出、冲减后为负，或冲销退货后“有效到货 + 有效取消”超过订购量，则整
+  单拒绝、不占用冲销单编号、原单不标记冲销，条件改善后可重试。
+  只能冲销成功的原始库存单据、到货单、取消单与退货单；原单不存在、采购单、冲
+  销单本身、已冲销过的原单均不能再次冲销，每张原单最多冲销一次。有未冲销退货
+  的到货单禁止冲销，相关退货全部冲销后可按原规则冲销。冲销成功后重放原单（含
+  到货单、取消单、退货单）仍只返回其最初结果，不会重新生效；重放冲销单返回原
+  冲销结果，不再变动，同编号改指其他原单则拒绝。
 
 整批导入规则：
   import --file <文件> 从本地 JSON 文件读取“有序单据对象数组”（至少一项），按
   列表顺序在同一批次中处理：新单据以此前各项生效后的余量核对并计算，后项可以
   使用前项入库/到货所得库存；到货、取消可引用导入前已登记或列表中此前登记的
-  采购单，其超收/超取消校验针对此前各项生效后的采购进度；盘点核对的是此前各项
-  之后的账面量；冲销可指向导入前已成功的原单（含到货单、取消单）或列表中此前
-  的新原单，尚未出现且未保存的原单不可引用。每张原单最多冲销一次，冲销单不可
-  冲销。每项格式（标识去首尾空白后非空、区分大小写）：
+  采购单，退货可引用导入前已成功或列表中此前成功的原到货单，其超收/超取消/
+  超退校验针对此前各项生效后的采购进度；盘点核对的是此前各项之后的账面量；
+  冲销可指向导入前已成功的原单（含到货单、取消单、退货单）或列表中此前的新
+  原单，尚未出现且未保存的原单不可引用。每张原单最多冲销一次，冲销单不可冲销。
+  每项格式（标识去首尾空白后非空、区分大小写）：
     入库 {"type":"in","id":"D1","wh":"W1","items":[{"product":"P1","qty":10}]}
     出库 {"type":"out","id":"D2","wh":"W1","items":[{"product":"P1","qty":4}]}
     调拨 {"type":"transfer","id":"D3","from":"W1","to":"W2","items":[{"product":"P1","qty":2}]}
@@ -2226,20 +2686,21 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
     采购 {"type":"po","id":"PO1","supplier":"S1","wh":"W1","items":[{"product":"P1","qty":10}]}
     到货 {"type":"arrival","id":"A1","po":"PO1","items":[{"product":"P1","qty":6}]}
     取消 {"type":"cancel","id":"X1","po":"PO1","items":[{"product":"P1","qty":2}]}
+    退货 {"type":"return","id":"T1","arrival":"A1","items":[{"product":"P1","qty":1}]}
     冲销 {"type":"reverse","id":"R1","orig":"D1"}
-  入出库、调拨、采购、到货、取消的 qty/订购量为正安全整数，同商品明细先合并再
-  校验；盘点 expected/actual 均为非负安全整数，同商品重复拒绝。库存、到货、
-  取消、冲销单据编号与单条命令共用唯一空间，采购编号独立；不产生批次编号：
-  导入前已有或本列表此前出现的“同编号同内容”项只返回原结果，不重新核对、
-  不追加流水（即使原单已冲销也不重新生效）；普通单比较类型、仓库及合并后商品
-  数量，盘点比较仓库及两种数量，采购比较供应商、收货仓及订购量，到货、取消
-  比较采购编号及合并数量，冲销比较原单编号，明细顺序无关。同编号不同内容或
-  不同业务整批拒绝。
+  入出库、调拨、采购、到货、取消、退货的 qty/订购量为正安全整数，同商品明细先
+  合并再校验；盘点 expected/actual 均为非负安全整数，同商品重复拒绝。库存、到
+  货、取消、退货、冲销单据编号与单条命令共用唯一空间，采购编号独立；不产生批
+  次编号：导入前已有或本列表此前出现的“同编号同内容”项只返回原结果，不重新
+  核对、不追加流水（即使原单已冲销也不重新生效）；普通单比较类型、仓库及合并
+  后商品数量，盘点比较仓库及两种数量，采购比较供应商、收货仓及订购量，到货、
+  取消比较采购编号及合并数量，退货比较原到货单编号及合并数量，冲销比较原单编
+  号，明细顺序无关。同编号不同内容或不同业务整批拒绝。
   整批成功须全部项通过，有新生效单据时整批一次性保存；全部重复时不改写数据。
-  任一项格式不合法、缺货、账面冲突、超收、超取消、溢出、编号冲突或非法冲销，
-  整批拒绝并指出位置和原因：此前已保存的单据不撤销，本批新库存、采购进度、
-  流水、编号与冲销关系均不保留，纠正后可复用这些新编号。文件无法读取、数据
-  损坏或保存失败均不改变已提交状态，也不报告部分成功。文件格式或参数错误
+  任一项格式不合法、缺货、账面冲突、超收、超取消、超退、溢出、编号冲突或非法
+  冲销，整批拒绝并指出位置和原因：此前已保存的单据不撤销，本批新库存、采购进
+  度、流水、编号与冲销关系均不保留，纠正后可复用这些新编号。文件无法读取、数
+  据损坏或保存失败均不改变已提交状态，也不报告部分成功。文件格式或参数错误
   退出 2，业务拒绝及读写失败退出 1。
 
 示例：
@@ -2252,12 +2713,14 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data arrival A1 --po PO1 --item P1:7
   node app.ts -d ./data cancel X1 --po PO1 --item P1:2
   node app.ts -d ./data arrival A2 --po PO1 --item P1:3
+  node app.ts -d ./data return T1 --arrival A1 --item P1:2
   node app.ts -d ./data po show PO1
   node app.ts -d ./data po list
   node app.ts -d ./data reverse R1 --orig D3
   node app.ts -d ./data reverse R2 --orig C1
   node app.ts -d ./data reverse R3 --orig A1
   node app.ts -d ./data reverse R4 --orig X1
+  node app.ts -d ./data reverse R5 --orig T1
   node app.ts -d ./data import --file ./docs.json
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
@@ -2349,6 +2812,11 @@ function run(argv: string[]): void {
     case 'cancel': {
       const store = loadStore(dataDir);
       runCancel(tokens, dataDir, store);
+      break;
+    }
+    case 'return': {
+      const store = loadStore(dataDir);
+      runReturn(tokens, dataDir, store);
       break;
     }
     case 'import': {
