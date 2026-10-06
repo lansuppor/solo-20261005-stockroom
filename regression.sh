@@ -359,5 +359,172 @@ out=$(run7 plan execute PL1)
 check "重启后已执行重放仍成立" "已执行，返回原落单结果" "$out"
 check_refuse7 "重启后同号改输入仍拒绝" "保存输入不同" plan save PL1 --transfer Q1:W2:W1:T1 --transfer Q1:W2:W4:T2 --transfer Q1:W3:W4:T3 --purchase Q1:W4:PO7:别的供应商
 
+echo "== 8. 期间库存对账报表 =="
+D9="$TMP/data9"
+run9() { node "$APP" -d "$D9" "$@"; }
+check_refuse9() { # check_refuse9 <描述> <期望错误文本> <命令...>（在 D9 数据目录下）
+  desc=$1; want=$2; shift 2
+  out=$(run9 "$@" 2>&1); code=$?
+  if [ $code -ne 1 ]; then
+    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+  else
+    check "$desc" "$want" "$out"
+  fi
+}
+run9 product add P1 螺丝 >/dev/null
+run9 product add P2 螺母 >/dev/null
+run9 in D1 --wh W1 --item P1:10 --item P2:5 >/dev/null      # #1 P1@W1 +10；#2 P2@W1 +5
+run9 in D2 --wh W2 --item P1:3 >/dev/null                   # #3 P1@W2 +3
+run9 transfer D3 --from W1 --to W2 --item P1:2 >/dev/null   # #4 W1 -2；#5 W2 +2
+run9 count C1 --wh W1 --item P2:5:5 >/dev/null              # #6 零差额盘点
+run9 po register PO1 --supplier S --wh W1 --item P1:4 >/dev/null
+run9 arrival A1 --po PO1 --item P1:4 >/dev/null             # #7 P1@W1 +4
+run9 return T1 --arrival A1 --item P1:1 >/dev/null          # #8 P1@W1 -1
+run9 out D4 --wh W1 --item P1:1 >/dev/null                  # #9 P1@W1 -1
+run9 reverse R1 --orig D4 >/dev/null                        # #10 P1@W1 +1
+run9 cancel X1 --po PO1 --item P1:1 >/dev/null              # 无库存流水
+run9 po register D2 --supplier S2 --wh W9 --item P2:1 >/dev/null  # 同名采购不干扰库存单定位
+# 全库全期间
+out=$(run9 reconcile)
+check "全库报表：P1@W1 期初/增减/净变动/期末" "商品 P1 仓库 W1：期初 0，期间增加 15，期间减少 4，净变动 +11，期末 11" "$out"
+check "小计按业务类型与是否冲销分列" "小计（出库·冲销）：+1" "$out"
+check "调拨按调出方向计减少" "小计（调拨·原单）：-2" "$out"
+check "到货计入实存" "小计（到货·原单）：+4" "$out"
+check "退货计入实存" "小计（退货·原单）：-1" "$out"
+check "零差额盘点保留追溯（小计为 0）" "小计（盘点·原单）：0" "$out"
+check "P1@W2 调入方向计增加" "商品 P1 仓库 W2：期初 0，期间增加 5，期间减少 0，净变动 +5，期末 5" "$out"
+check "期间流水带采购与原到货关联" "#8	单据=T1	退货	商品=P1	仓库=W1	-1	12->11	采购单=PO1	原到货单=A1" "$out"
+check "冲销流水标注原单" "#10	单据=R1	冲销出库	商品=P1	仓库=W1	+1	10->11	原单=D4" "$out"
+check "逐商品汇总所选仓库" "商品 P1 汇总（所选仓库）：期初 0，期间增加 20，期间减少 4，净变动 +16，期末 16" "$out"
+check "原单冲销状态（截至当前）" "原单 D4 已由冲销单 R1 冲销" "$out"
+# 期间边界：起点不含、终点含
+out=$(run9 reconcile --from D1 --to D3)
+check "起点不含该单（期初为起点完成后状态）" "商品 P1 仓库 W1：期初 10，期间增加 0，期间减少 2，净变动 -2，期末 8" "$out"
+check "终点包含该单全部流水（调拨两端不拆开）" "商品 P1 仓库 W2：期初 0，期间增加 5，期间减少 0，净变动 +5，期末 5" "$out"
+check "期初非零但期间无流水的组合仍展示" "商品 P2 仓库 W1：期初 5，期间增加 0，期间减少 0，净变动 0，期末 5" "$out"
+case $out in
+  *"已由冲销单"*) echo "FAIL - 终点之前的报表不应含后续冲销状态"; FAIL=1 ;;
+  *) echo "ok   - 终点之后的冲销不影响历史报表" ;;
+esac
+# 同一单作两端 = 空期间
+out=$(run9 reconcile --from D3 --to D3)
+check "同一单作两端提示空期间" "期间为空" "$out"
+check "空期间期初等于期末" "商品 P1 仓库 W1：期初 8，期间增加 0，期间减少 0，净变动 0，期末 8" "$out"
+# 冲销单与零差额盘点可作边界
+out=$(run9 reconcile --from C1 --to R1 --product P1 --wh W1)
+check "零差额盘点与冲销单可作边界" "商品 P1 仓库 W1：期初 8，期间增加 5，期间减少 2，净变动 +3，期末 11" "$out"
+# 同名采购不干扰库存单定位（D2 是入库单，也是采购单）
+out=$(run9 reconcile --from D2 --product P1 --wh W1)
+check "同名采购不干扰库存单定位" "起点 D2（不含该单" "$out"
+# 筛选
+out=$(run9 reconcile --product P2 --wh W2)
+check "无匹配组合明确提示" "无匹配的组合" "$out"
+out=$(run9 reconcile --wh W2)
+check "按仓库筛选" "商品 P1 仓库 W2：期初 0，期间增加 5，期间减少 0，净变动 +5，期末 5" "$out"
+# 边界拒绝
+check_refuse9 "采购单不能用作边界" "是采购单：采购登记不产生库存流水" reconcile --from PO1
+check_refuse9 "取消单不能用作边界" "是取消单：取消不产生库存流水" reconcile --to X1
+check_refuse9 "不存在的边界拒绝" "不存在或没有库存流水" reconcile --from NOPE
+check_refuse9 "起点晚于终点拒绝" "首次提交顺序晚于终点单据" reconcile --from D4 --to D1
+# 参数格式错误退出 2
+out=$(run9 reconcile --bogus x 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - 未知参数退出码应为 2，实际 $code"; FAIL=1; }
+out=$(run9 reconcile D1 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - 多余位置参数退出码应为 2，实际 $code"; FAIL=1; }
+# 只读：反复查询不改写数据
+SUM_BEFORE=$(cksum -o 3 "$D9/stockroom.json")
+run9 reconcile >/dev/null
+run9 reconcile --from D1 --to D3 --product P1 >/dev/null
+SUM_AFTER=$(cksum -o 3 "$D9/stockroom.json")
+[ "$SUM_BEFORE" = "$SUM_AFTER" ] || { echo "FAIL - reconcile 改写了数据文件"; FAIL=1; }
+echo "ok   - 反复查询不创建或改写数据"
+# 特殊标识：含冒号与 __proto__ 的商品/仓库/单据可定位与筛选
+D10="$TMP/data10"
+node "$APP" -d "$D10" product add "a:1" 冒号件 >/dev/null
+node "$APP" -d "$D10" product add __proto__ 特殊件 >/dev/null
+cat > "$TMP/imp10.json" <<'EOF'
+[{"type":"in","id":"D:1","wh":"w:1","items":[{"product":"a:1","qty":7},{"product":"__proto__","qty":2}]},
+ {"type":"out","id":"D2","wh":"w:1","items":[{"product":"__proto__","qty":1}]}]
+EOF
+node "$APP" -d "$D10" import --file "$TMP/imp10.json" >/dev/null
+out=$(node "$APP" -d "$D10" reconcile --product "a:1")
+check "含冒号商品与仓库可筛选" "商品 a:1 仓库 w:1：期初 0，期间增加 7，期间减少 0，净变动 +7，期末 7" "$out"
+out=$(node "$APP" -d "$D10" reconcile --from "D:1" --product __proto__)
+check "含冒号单据可作边界、__proto__ 可筛选" "商品 __proto__ 仓库 w:1：期初 2，期间增加 0，期间减少 1，净变动 -1，期末 1" "$out"
+# 精度：期间增加合计超安全整数仍完整十进制显示
+D11="$TMP/data11"
+node "$APP" -d "$D11" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D11" in A1 --wh W --item P1:${M} >/dev/null
+node "$APP" -d "$D11" out A2 --wh W --item P1:${M} >/dev/null
+node "$APP" -d "$D11" in A3 --wh W --item P1:${M} >/dev/null
+out=$(node "$APP" -d "$D11" reconcile --product P1)
+check "期间增加合计超安全整数完整显示" "期间增加 18014398509481982，期间减少 ${M}，净变动 +${M}，期末 ${M}" "$out"
+# 一致性核对失败：不输出部分报表、不自动修复
+BAD9="$TMP/bad9"
+mkdir -p "$BAD9"
+cat > "$BAD9/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":8}},
+ "entries":[{"seq":1,"doc":"A","type":"in","product":"P9","wh":"W","qty":5,"before":0,"after":5},
+            {"seq":2,"doc":"B","type":"in","product":"P9","wh":"W","qty":3,"before":1,"after":4}],
+ "docs":{"A":{"content":{"type":"in","wh":"W","items":{"P9":5}},"resultLines":[]},
+         "B":{"content":{"type":"in","wh":"W","items":{"P9":3}},"resultLines":[]}},
+ "reversals":{}}
+EOF
+out=$(node "$APP" -d "$BAD9" reconcile 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 余量不连续应拒报（退出码 1，实际 $code）"; FAIL=1
+else
+  check "余量连续性核对失败拒报" "不连续，拒绝输出报表" "$out"
+  case $out in
+    *"期末"*) echo "FAIL - 不一致时不应输出部分报表"; FAIL=1 ;;
+    *) echo "ok   - 不一致时不输出部分报表" ;;
+  esac
+fi
+cat > "$BAD9/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W2":2}},
+ "entries":[{"seq":1,"doc":"T","type":"transfer","product":"P9","wh":"W2","qty":2,"before":0,"after":2,"from":"W1","to":"W2"}],
+ "docs":{"T":{"content":{"type":"transfer","from":"W1","to":"W2","items":{"P9":2}},"resultLines":[]}},
+ "reversals":{}}
+EOF
+out=$(node "$APP" -d "$BAD9" reconcile 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 调拨缺一端应拒报（退出码 1，实际 $code）"; FAIL=1
+else
+  check "调拨两端完整性核对失败拒报" "两端流水不完整" "$out"
+fi
+cat > "$BAD9/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":3}},
+ "entries":[{"seq":1,"doc":"A","type":"in","product":"P9","wh":"W","qty":5,"before":0,"after":5}],
+ "docs":{"A":{"content":{"type":"in","wh":"W","items":{"P9":5}},"resultLines":[]}},
+ "reversals":{}}
+EOF
+out=$(node "$APP" -d "$BAD9" reconcile 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 末笔与实存不一致应拒报（退出码 1，实际 $code）"; FAIL=1
+else
+  check "末笔余量与实存不一致拒报" "与当前实存 3 不一致" "$out"
+fi
+# 旧数据（无采购/规则/方案等字段、流水与实存一致）无需迁移即可出报表
+OLD9="$TMP/old9"
+mkdir -p "$OLD9"
+cat > "$OLD9/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":5}},
+ "entries":[{"seq":1,"doc":"D1","type":"in","product":"P9","wh":"W","qty":5,"before":0,"after":5}],
+ "docs":{"D1":{"content":{"type":"in","wh":"W","items":{"P9":5}},"resultLines":[]}},
+ "reversals":{}}
+EOF
+out=$(node "$APP" -d "$OLD9" reconcile)
+check "合法旧 JSON 无需迁移即可出报表" "商品 P9 仓库 W：期初 0，期间增加 5，期间减少 0，净变动 +5，期末 5" "$out"
+# 有实存但无任何流水的组合视为末笔与实存不一致
+cat > "$BAD9/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":3}},"entries":[],"docs":{},"reversals":{}}
+EOF
+out=$(node "$APP" -d "$BAD9" reconcile 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 有实存无流水应拒报（退出码 1，实际 $code）"; FAIL=1
+else
+  check "有实存无流水视为不一致拒报" "流水末笔余量 0 与当前实存 3 不一致" "$out"
+fi
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
