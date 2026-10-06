@@ -83,6 +83,11 @@ interface ReturnRecord {
   resultLines: string[]; // 退货提交结果，供幂等重放
 }
 
+interface ReorderRule {
+  min: number; // 补货下限（非负安全整数）
+  target: number; // 补货目标（非负安全整数，恒大于下限）
+}
+
 interface Store {
   version: 1;
   products: Record<string, string>; // 编号 -> 名称（编号区分大小写；null 原型，防特殊键串改）
@@ -94,6 +99,7 @@ interface Store {
   arrivals: Record<string, ArrivalRecord>; // 到货单去重与结果（与库存单共用编号空间）
   cancels: Record<string, CancelRecord>; // 取消单去重与结果（与库存单共用编号空间，不改库存与流水）
   returns: Record<string, ReturnRecord>; // 退货单去重与结果（与库存单共用编号空间）
+  reorderRules: Record<string, Record<string, ReorderRule>>; // 商品 -> 仓库 -> 补货规则（每组合唯一）
 }
 
 const REV_ENTRY_TYPES = new Set<EntryType>([
@@ -116,6 +122,7 @@ function emptyStore(): Store {
     arrivals: nullProto(),
     cancels: nullProto(),
     returns: nullProto(),
+    reorderRules: nullProto(),
   };
 }
 
@@ -634,6 +641,29 @@ function validateStore(data: unknown): Store {
         if ((arrived[pid] ?? 0n) + cancelled[pid] > BigInt(po.ordered[pid]))
           throw bad(`采购单 ${poId} 商品 ${pid} 有效到货与有效取消合计超过订购量（待到货量为负）`);
       }
+    }
+  }
+
+  // reorderRules 为新增字段：合法旧数据没有该字段，按无规则处理并保留原结果；
+  // 含非法规则（非对象、未登记商品、非法仓库标识、数量非法或下限不小于目标）属于
+  // 损坏数据，拒绝读取，也拒绝被当作空库覆盖。
+  if (data.reorderRules !== undefined) {
+    if (!isPlainObject(data.reorderRules)) throw bad('reorderRules 不是对象');
+    for (const [pid, whs] of Object.entries(data.reorderRules)) {
+      if (typeof pid !== 'string' || pid.trim() === '') throw bad('补货规则中存在非法商品编号');
+      if (store.products[pid] === undefined) throw bad(`补货规则指向未登记商品 ${pid}`);
+      if (!isPlainObject(whs)) throw bad(`商品 ${pid} 的补货规则不是对象`);
+      const ruleMap = nullProto<Record<string, ReorderRule>>();
+      for (const [wh, rule] of Object.entries(whs)) {
+        if (typeof wh !== 'string' || wh.trim() === '')
+          throw bad(`商品 ${pid} 的补货规则存在非法仓库标识`);
+        if (!isPlainObject(rule) || !isNonNegSafeInt(rule.min) || !isNonNegSafeInt(rule.target))
+          throw bad(`商品 ${pid} 仓库 ${wh} 的补货规则非法（下限与目标必须为非负安全整数）`);
+        if (rule.min >= rule.target)
+          throw bad(`商品 ${pid} 仓库 ${wh} 的补货规则非法（下限必须小于目标）`);
+        ruleMap[wh] = { min: rule.min, target: rule.target };
+      }
+      store.reorderRules[pid] = ruleMap;
     }
   }
 
@@ -2479,6 +2509,193 @@ function runPo(rest: string[], dataDir: string, store: Store): void {
   throw new UsageError(sub === undefined ? '用法：po <register|show|list> …' : `未知 po 子命令：${sub}`);
 }
 
+// ---------- 补货规则与跨仓补货建议 ----------
+
+interface ReorderSuggestion {
+  pid: string;
+  wh: string;
+  min: number;
+  target: number;
+  onHand: number; // 本仓实存（无库存记录视为零）
+  pending: bigint; // 待收合计：收货仓为本仓的全部采购单中该商品待到货量之和（不限供应商）
+  projected: bigint; // 预计量 = 本仓实存 + 待收合计（其他仓库存不计入）
+  triggered: boolean; // 预计量不高于下限才触发
+  gap: bigint; // 缺口 = 目标 - 预计量（仅触发时为正）
+  transfers: { from: string; qty: bigint }[]; // 各调拨来源及数量（来源仓标识升序）
+  transferTotal: bigint; // 调拨合计
+  purchase: bigint; // 采购量 = 剩余缺口（可为零）
+}
+
+/**
+ * 按当前已提交状态计算跨仓补货建议（只读，不写文件、不改库存与采购）。
+ * 待到货 = 订购量 - 有效到货量 - 有效取消量（有效到货 = 未冲销到货 - 未冲销退货，
+ * 有效取消只计未冲销取消；已收货数量不再计入待收，不会重复计算）。
+ * 按商品分别分配：同商品其他已配置仓“实存超过自身目标”的部分可供调拨（待收不可调，
+ * 未配置仓既不产生需求也不提供调拨）；缺货仓与来源仓各按标识升序，依次为每个缺货仓
+ * 从来源取量直到补足缺口或来源耗尽，整份建议对同一来源的累计分配不超过其可供量；
+ * 剩余缺口即采购量。全程 BigInt 精确计算，同状态结果一致。
+ */
+function computeReorderSuggestions(store: Store): ReorderSuggestion[] {
+  // 每商品每仓待收合计：按采购单进度归集到其收货仓
+  const pendingByWh = nullProto<Record<string, Record<string, bigint>>>();
+  for (const [poId, po] of Object.entries(store.purchases)) {
+    const { remaining } = purchaseProgress(store, poId);
+    for (const [pid, rem] of Object.entries(remaining)) {
+      const perWh = (pendingByWh[pid] ??= nullProto<Record<string, bigint>>());
+      perWh[po.wh] = (perWh[po.wh] ?? 0n) + rem;
+    }
+  }
+
+  const rows: ReorderSuggestion[] = [];
+  for (const pid of Object.keys(store.reorderRules).sort()) {
+    const whMap = store.reorderRules[pid];
+    const combos: ReorderSuggestion[] = Object.keys(whMap)
+      .sort()
+      .map((wh) => {
+        const rule = whMap[wh];
+        const onHand = getStock(store.stock, pid, wh);
+        const pending = pendingByWh[pid]?.[wh] ?? 0n;
+        const projected = BigInt(onHand) + pending;
+        const triggered = projected <= BigInt(rule.min); // 不高于下限才触发
+        return {
+          pid, wh, min: rule.min, target: rule.target, onHand, pending, projected,
+          triggered, gap: triggered ? BigInt(rule.target) - projected : 0n,
+          transfers: [], transferTotal: 0n, purchase: 0n,
+        };
+      });
+
+    // 可供调拨量：其他已配置仓实存超过自身目标的部分（触发仓预计量不高于下限，
+    // 实存必然低于目标，天然没有盈余；待收不计入可供量）
+    const available = nullProto<Record<string, bigint>>();
+    for (const c of combos) {
+      const surplus = BigInt(c.onHand) - BigInt(c.target);
+      if (surplus > 0n) available[c.wh] = surplus;
+    }
+    const sources = Object.keys(available).sort();
+
+    // 缺货仓按标识升序，依次从来源仓（标识升序）取量，直到补足缺口或来源耗尽
+    for (const c of combos) {
+      if (!c.triggered) continue;
+      let rest = c.gap;
+      for (const src of sources) {
+        if (rest === 0n) break;
+        if (src === c.wh) continue; // 本仓不作为自身来源（防御；触发仓本无盈余）
+        const avail = available[src];
+        if (avail <= 0n) continue;
+        const take = avail < rest ? avail : rest;
+        available[src] = avail - take; // 整份建议对来源的累计分配不超过可供量
+        c.transfers.push({ from: src, qty: take });
+        c.transferTotal += take;
+        rest -= take;
+      }
+      c.purchase = rest; // 剩余缺口即采购量（可为零）
+    }
+    rows.push(...combos);
+  }
+  return rows;
+}
+
+function runReorder(rest: string[], dataDir: string, store: Store): void {
+  const sub = rest[0];
+  const tokens = rest.slice(1);
+
+  if (sub === 'set') {
+    const args = parseArgs(tokens, ['--wh', '--min', '--target']);
+    const [pidRaw, ...extra] = args.positionals;
+    if (pidRaw === undefined || extra.length > 0)
+      throw new UsageError('用法：reorder set <商品编号> --wh <仓库> --min <下限> --target <目标>');
+    if (args.flags['--wh'] === undefined) throw new UsageError('设置补货规则必须提供 --wh <仓库>');
+    if (args.flags['--min'] === undefined) throw new UsageError('设置补货规则必须提供 --min <下限>');
+    if (args.flags['--target'] === undefined) throw new UsageError('设置补货规则必须提供 --target <目标>');
+    const pid = trimOrThrow('商品编号', pidRaw);
+    const wh = trimOrThrow('仓库标识', args.flags['--wh']);
+    const min = parseNonNegInt('补货下限', args.flags['--min']);
+    const target = parseNonNegInt('补货目标', args.flags['--target']);
+    if (min >= target) throw new BizError(`补货下限 ${min} 必须小于目标 ${target}，拒绝设置`);
+    if (store.products[pid] === undefined) throw new BizError(`商品未登记，拒绝设置补货规则：${pid}`);
+    const replaced = store.reorderRules[pid]?.[wh] !== undefined;
+    // 同商品同仓库再次设置整体替换（每组合唯一规则）
+    (store.reorderRules[pid] ??= nullProto<Record<string, ReorderRule>>())[wh] = { min, target };
+    saveStore(dataDir, store); // 原子保存成功后才报告成功，失败保留已提交状态
+    console.log(`已${replaced ? '整体替换' : '设置'}补货规则：商品 ${pid} 仓库 ${wh}，下限 ${min}，目标 ${target}`);
+    return;
+  }
+
+  if (sub === 'remove' || sub === 'rm') {
+    const args = parseArgs(tokens, ['--wh']);
+    const [pidRaw, ...extra] = args.positionals;
+    if (pidRaw === undefined || extra.length > 0)
+      throw new UsageError('用法：reorder remove <商品编号> --wh <仓库>');
+    if (args.flags['--wh'] === undefined) throw new UsageError('删除补货规则必须提供 --wh <仓库>');
+    const pid = trimOrThrow('商品编号', pidRaw);
+    const wh = trimOrThrow('仓库标识', args.flags['--wh']);
+    const ruleMap = store.reorderRules[pid];
+    if (ruleMap === undefined || ruleMap[wh] === undefined)
+      throw new BizError(`商品 ${pid} 仓库 ${wh} 没有补货规则，拒绝删除`);
+    delete ruleMap[wh];
+    if (Object.keys(ruleMap).length === 0) delete store.reorderRules[pid];
+    saveStore(dataDir, store);
+    console.log(`已删除补货规则：商品 ${pid} 仓库 ${wh}`);
+    return;
+  }
+
+  if (sub === 'list' || sub === 'ls') {
+    const args = parseArgs(tokens, []);
+    if (args.positionals.length > 0) throw new UsageError('用法：reorder list');
+    const lines: string[] = [];
+    for (const pid of Object.keys(store.reorderRules).sort()) {
+      for (const wh of Object.keys(store.reorderRules[pid]).sort()) {
+        const r = store.reorderRules[pid][wh];
+        lines.push(`${pid}\t${wh}\t${r.min}\t${r.target}`);
+      }
+    }
+    console.log(`补货规则（${lines.length}）：`);
+    if (lines.length === 0) {
+      console.log('（暂无补货规则）');
+    } else {
+      console.log('商品\t仓库\t下限\t目标');
+      for (const l of lines) console.log(l);
+    }
+    return;
+  }
+
+  if (sub === 'suggest') {
+    const args = parseArgs(tokens, []);
+    if (args.positionals.length > 0) throw new UsageError('用法：reorder suggest');
+    const rows = computeReorderSuggestions(store);
+    if (rows.length === 0) {
+      console.log('未配置任何补货规则，无补货建议。');
+      return;
+    }
+    const triggered = rows.filter((r) => r.triggered);
+    console.log(
+      `补货建议：共 ${rows.length} 组规则，触发 ${triggered.length} 组` +
+        `（按商品、仓库标识升序；仅计算当前已提交状态，不改动库存与采购）：`,
+    );
+    console.log('商品\t仓库\t下限\t目标\t实存\t待收\t预计量\t触发');
+    for (const r of rows) {
+      // BigInt 直接插值：待收/预计量等合计超过安全整数范围仍显示完整十进制整数
+      console.log(
+        `${r.pid}\t${r.wh}\t${r.min}\t${r.target}\t${r.onHand}\t${r.pending}\t${r.projected}\t` +
+          (r.triggered ? '触发' : '未触发'),
+      );
+      if (r.triggered) {
+        console.log(`  缺口 ${r.gap}（目标 ${r.target} - 预计量 ${r.projected}）：`);
+        if (r.transfers.length === 0) console.log('  调拨：（其他已配置仓无可调拨盈余）');
+        else for (const t of r.transfers) console.log(`  调拨 ${t.from} -> ${r.wh}：${t.qty}`);
+        console.log(`  调拨合计 ${r.transferTotal}，采购量 ${r.purchase}`);
+      }
+    }
+    if (triggered.length === 0)
+      console.log('无缺货：所有已配置组合的预计量均高于下限，无需调拨或采购。');
+    return;
+  }
+
+  throw new UsageError(
+    sub === undefined ? '用法：reorder <set|list|remove|suggest> …' : `未知 reorder 子命令：${sub}`,
+  );
+}
+
 function runArrival(rest: string[], dataDir: string, store: Store): void {
   const req = parseArrivalArgs(rest);
   const ledger = new Ledger(store);
@@ -2616,6 +2833,11 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   return <退货单编号> --arrival <原到货单编号> \\
         --item <编号:退货量> [...]                         采购部分退货（从原收货仓扣减，退回后等待补收）
   reverse <冲销单编号> --orig <原单编号>     整单冲销已成功的入库/出库/调拨/盘点/到货/取消/退货单
+  reorder set <商品编号> --wh <仓库> \\
+        --min <下限> --target <目标>                    设置补货规则（同组合再次设置整体替换）
+  reorder list                                        列出全部补货规则
+  reorder remove <商品编号> --wh <仓库>                删除补货规则
+  reorder suggest                                     跨仓补货建议（先调拨、不足再采购；只读不写文件）
   import --file <单据列表.json>              整批导入有序单据列表（按顺序生效，整批成败一致）
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
@@ -2660,6 +2882,20 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   货单、取消单、退货单与冲销单关联；flow 可凭采购单编号追溯到货、退货与各自
   冲销流水。进度按精确整数计算：反复退货、补收下累计到货或退货可超过安全整数
   上限，净进度不受影响；有效退货合计超安全整数时仍显示完整十进制整数。
+
+补货规则与建议：
+  reorder set 为已登记商品与仓库设置唯一补货规则（下限、目标均为非负安全整数，
+  且下限小于目标；仓库无需登记，无库存记录视为零），同组合再次设置整体替换；
+  reorder list 查看、reorder remove 删除。规则原子保存后才报成功，重启及其他
+  命令保存后仍有效；合法旧数据按无规则处理，含非法规则的损坏数据拒绝读取。
+  reorder suggest 取当前已提交状态逐组合输出下限、目标、实存、待收合计、预计量
+  与触发情况：待收合计 = 收货仓为本仓的全部采购单（不限供应商）中该商品待到货量
+  之和（订购 - 有效到货 - 有效取消，已到货数量不重复计入）；预计量 = 本仓实存 +
+  待收合计，不高于下限才触发，缺口 = 目标 - 预计量。按商品分别分配：同商品其他
+  已配置仓实存超过自身目标的部分可供调拨（待收不可调，未配置仓既不产生需求也
+  不提供调拨），缺货仓与来源仓各按标识升序依次取量，整份建议对同一来源的累计
+  分配不超过其可供量；剩余缺口即采购量（含零采购）。建议只读不写文件，合计按
+  精确整数计算，超安全整数合计完整十进制显示，同状态结果一致。
 
 冲销规则：
   冲销在“当前余量”上应用原单的相反变动，不回滚原单之后的其他业务、不恢复绝对
@@ -2722,6 +2958,8 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data arrival A2 --po PO1 --item P1:3
   node app.ts -d ./data po show PO1
   node app.ts -d ./data po list
+  node app.ts -d ./data reorder set P1 --wh W1 --min 5 --target 20
+  node app.ts -d ./data reorder suggest
   node app.ts -d ./data reverse R1 --orig D3
   node app.ts -d ./data reverse R2 --orig C1
   node app.ts -d ./data reverse R3 --orig A1
@@ -2809,6 +3047,11 @@ function run(argv: string[]): void {
     case 'po': {
       const store = loadStore(dataDir);
       runPo(tokens, dataDir, store);
+      break;
+    }
+    case 'reorder': {
+      const store = loadStore(dataDir);
+      runReorder(tokens, dataDir, store);
       break;
     }
     case 'arrival': {

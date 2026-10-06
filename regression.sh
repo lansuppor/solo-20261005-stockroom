@@ -1,5 +1,5 @@
 #!/bin/sh
-# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放。
+# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与建议。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -138,6 +138,93 @@ if [ $code -ne 1 ]; then
   echo "FAIL - 负待到货损坏数据应拒绝读取（退出码 1，实际 $code）"; FAIL=1
 else
   check "负待到货损坏数据拒绝读取" "待到货量为负" "$out"
+fi
+
+echo "== 6. 补货规则与跨仓补货建议 =="
+run product add P4 扳手 >/dev/null
+run in I1 --wh WH-A --item P4:100 >/dev/null
+run in I2 --wh WH-B --item P4:3 >/dev/null
+run reorder set P4 --wh WH-A --min 10 --target 50 >/dev/null   # 实存 100 > 目标 50，可供 50
+run reorder set P4 --wh WH-B --min 10 --target 20 >/dev/null
+run reorder set P4 --wh WH-C --min 0 --target 5 >/dev/null     # 无库存记录视为零
+run reorder set P4 --wh WH-D --min 0 --target 100 >/dev/null
+run po register PO6 --supplier S6 --wh WH-B --item P4:4 >/dev/null  # WH-B 待收 4
+out=$(run reorder list)
+check "规则列表含全部组合" "P4	WH-B	10	20" "$out"
+out=$(run reorder suggest)
+check "WH-A 未触发（预计量高于下限）" "P4	WH-A	10	50	100	0	100	未触发" "$out"
+check "WH-B 预计量=实存3+待收4=7 触发" "P4	WH-B	10	20	3	4	7	触发" "$out"
+check "WH-B 从 WH-A 调拨 13、零采购" "调拨 WH-A -> WH-B：13" "$out"
+check "WH-B 调拨合计与零采购" "调拨合计 13，采购量 0" "$out"
+check "WH-C 缺口 5 全部由调拨补足" "调拨 WH-A -> WH-C：5" "$out"
+check "WH-D 来源耗尽后剩余缺口采购（50-13-5=32）" "调拨 WH-A -> WH-D：32" "$out"
+check "WH-D 采购量 68" "调拨合计 32，采购量 68" "$out"
+# 取消减少待收：WH-B 待收 4->2，预计量 5，缺口 15
+run cancel X6 --po PO6 --item P4:2 >/dev/null
+out=$(run reorder suggest)
+check "取消后待收下降、缺口增大" "P4	WH-B	10	20	3	2	5	触发" "$out"
+check "取消后调拨量按新状态重算" "调拨 WH-A -> WH-B：15" "$out"
+# 到货不重复计入待收：到货 2 后实存 5、待收 0，预计量仍为 5
+run arrival A6 --po PO6 --item P4:2 >/dev/null
+out=$(run reorder suggest)
+check "到货后实存升、待收降，预计量不重复计入" "P4	WH-B	10	20	5	0	5	触发" "$out"
+# 再次设置整体替换：WH-B 下限降为 1 后不再触发
+out=$(run reorder set P4 --wh WH-B --min 1 --target 6)
+check "再次设置整体替换" "已整体替换补货规则：商品 P4 仓库 WH-B，下限 1，目标 6" "$out"
+out=$(run reorder suggest)
+check "替换后 WH-B 预计量高于新下限不再触发" "P4	WH-B	1	6	5	0	5	未触发" "$out"
+# 删除规则后该组合不再出现；重复删除拒绝
+run reorder remove P4 --wh WH-D >/dev/null
+out=$(run reorder suggest)
+case $out in
+  *"WH-D"*) echo "FAIL - 删除后 WH-D 不应再出现"; FAIL=1 ;;
+  *) echo "ok   - 删除后 WH-D 不再产生需求" ;;
+esac
+check_refuse "重复删除规则拒绝" "没有补货规则，拒绝删除" reorder remove P4 --wh WH-D
+check_refuse "下限不小于目标拒绝" "必须小于目标" reorder set P4 --wh WH-A --min 5 --target 5
+check_refuse "未登记商品拒绝设置规则" "商品未登记，拒绝设置补货规则：PX" reorder set PX --wh WH-A --min 1 --target 2
+out=$(run reorder set P4 --wh WH-A --min 1 2>&1); code=$?
+if [ $code -ne 2 ]; then
+  echo "FAIL - 缺少 --target 应退出 2，实际 $code"; FAIL=1
+else
+  check "缺少 --target 报用法错误退出 2" "必须提供 --target" "$out"
+fi
+# 建议只读：查询前后数据文件不变
+before=$(cksum < "$D/stockroom.json")
+run reorder suggest >/dev/null
+after=$(cksum < "$D/stockroom.json")
+if [ "$before" = "$after" ]; then echo "ok   - 建议查询不写文件"; else echo "FAIL - 建议查询改写了数据文件"; FAIL=1; fi
+# 重启（新进程）后规则仍有效
+out=$(run reorder list)
+check "重载后规则仍有效" "P4	WH-A	10	50" "$out"
+# 合法旧数据（无 reorderRules 字段）按无规则处理并保留原结果
+OLD="$TMP/old"
+mkdir -p "$OLD"
+cat > "$OLD/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":3}},"entries":[],"docs":{}}
+EOF
+out=$(node "$APP" -d "$OLD" reorder suggest)
+check "旧数据按无规则处理" "未配置任何补货规则，无补货建议" "$out"
+out=$(node "$APP" -d "$OLD" balance P9)
+check "旧数据原有查询结果保留" "仓库 W：3" "$out"
+# 损坏数据：非法补货规则拒绝读取与覆盖
+BAD2="$TMP/bad2"
+mkdir -p "$BAD2"
+cat > "$BAD2/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{},"entries":[],"docs":{},
+ "reorderRules":{"P9":{"W":{"min":5,"target":5}}}}
+EOF
+out=$(node "$APP" -d "$BAD2" reorder suggest 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 非法补货规则应拒绝读取（退出码 1，实际 $code）"; FAIL=1
+else
+  check "非法补货规则拒绝读取" "下限必须小于目标" "$out"
+fi
+out=$(node "$APP" -d "$BAD2" reorder set P9 --wh W --min 1 --target 2 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 损坏数据上设置规则应拒绝（退出码 1，实际 $code）"; FAIL=1
+else
+  check "损坏数据拒绝被覆盖" "拒绝启动以免覆盖原数据" "$out"
 fi
 
 echo
