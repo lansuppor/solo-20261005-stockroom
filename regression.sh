@@ -1,5 +1,5 @@
 #!/bin/sh
-# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放。
+# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -139,6 +139,82 @@ if [ $code -ne 1 ]; then
 else
   check "负待到货损坏数据拒绝读取" "待到货量为负" "$out"
 fi
+
+echo "== 6. 补货规则与跨仓补货建议 =="
+run product add P10 扳手 >/dev/null
+run in H1 --wh W1 --item P10:3 >/dev/null
+run in H2 --wh W2 --item P10:50 >/dev/null
+run in H3 --wh W3 --item P10:5 >/dev/null
+# 采购 4、到货 1、取消 1 -> W1 待到货合计 2（有效到货/有效取消均精确抵减）
+run po register PO10 --supplier S10 --wh W1 --item P10:4 >/dev/null
+run arrival J1 --po PO10 --item P10:1 >/dev/null
+run cancel K1 --po PO10 --item P10:1 >/dev/null
+run rule set P10 --wh W1 --min 8 --target 20 >/dev/null
+run rule set P10 --wh W2 --min 2 --target 10 >/dev/null
+run rule set P10 --wh W3 --min 1 --target 4 >/dev/null
+run rule set P10 --wh W4 --min 10 --target 30 >/dev/null
+out=$(run rule list)
+check "规则列表（4 条，按商品、仓库升序）" "P10	W1	8	20" "$out"
+out=$(run rule set P10 --wh W1 --min 8 --target 20)
+check "同组合再次设置整体替换" "已替换补货规则" "$out"
+check_refuse "下限不小于目标拒绝" "下限 20 必须小于目标 20" rule set P10 --wh W1 --min 20 --target 20
+check_refuse "未登记商品拒绝设置规则" "商品未登记" rule set PX --wh W1 --min 1 --target 9
+out=$(run rule set P10 --wh W1 --min 8 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - 缺少 --target 退出码应为 2，实际 $code"; FAIL=1; }
+# W1：实存 4（入库 3 + 到货 1）+ 待到货 2 = 预计量 6 <= 下限 8，缺口 14，全部由 W2 调拨
+# W4：实存 0，缺口 30；W2 剩余 26 + W3 可供 1 = 调拨 27，采购 3
+out=$(run replenish)
+check "W1 预计量=实存+待到货合计并触发" "商品 P10 仓库 W1：下限 8，目标 20，实存 4，待到货合计 2，预计量 6，触发补货，缺口 14" "$out"
+check "W1 从 W2 调拨 14、零采购" "调拨 W2 -> W1：14" "$out"
+check "W1 调拨合计与零采购" "调拨合计 14，采购量 0" "$out"
+check "W2 实存超目标部分可供调拨（自身未触发）" "商品 P10 仓库 W2：下限 2，目标 10，实存 50，待到货合计 0，预计量 50，未触发" "$out"
+check "W4 触发且缺口 30" "商品 P10 仓库 W4：下限 10，目标 30，实存 0，待到货合计 0，预计量 0，触发补货，缺口 30" "$out"
+check "W4 先用 W2 剩余可供量 26" "调拨 W2 -> W4：26" "$out"
+check "W4 再从 W3 取 1" "调拨 W3 -> W4：1" "$out"
+check "W4 剩余缺口即采购量" "调拨合计 27，采购量 3" "$out"
+out2=$(run replenish)
+[ "$out" = "$out2" ] || { echo "FAIL - 同状态两次 replenish 结果不一致"; FAIL=1; }
+out3=$(run balance P10 --wh W2)
+check "建议查询不改变库存" "余量：商品 P10 仓库 W2 = 50" "$out3"
+# 冲销到货后待到货合计按新状态重算（实存扣回为 3，有效到货 0，待到货 3，预计量 6）
+run reverse R9 --orig J1 >/dev/null
+out=$(run replenish)
+check "冲销到货后建议按新状态重算" "实存 3，待到货合计 3，预计量 6，触发补货，缺口 14" "$out"
+out=$(run rule delete P10 --wh W4)
+check "删除规则成功" "已删除补货规则：商品 P10 仓库 W4" "$out"
+check_refuse "删除不存在的规则拒绝" "补货规则不存在" rule delete P10 --wh W4
+out=$(run replenish)
+check "删除后该组合不再产生需求" "规则 3 条，触发 1 条" "$out"
+# 规则随数据保存，重启（新进程）后仍有效
+out=$(run rule list)
+check "重启后规则仍有效" "P10	W3	1	4" "$out"
+# 无规则时明确提示
+D6="$TMP/data6"
+out=$(node "$APP" -d "$D6" replenish)
+check "无规则明确提示" "未配置任何补货规则" "$out"
+# 损坏数据：非法补货规则拒绝读取与覆盖
+BAD6="$TMP/bad6"
+mkdir -p "$BAD6"
+cat > "$BAD6/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{},"arrivals":{},"cancels":{},"returns":{},
+ "rules":{"P9":{"W":{"min":5,"target":5}}}}
+EOF
+out=$(node "$APP" -d "$BAD6" rule list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 非法补货规则应拒绝读取（退出码 1，实际 $code）"; FAIL=1
+else
+  check "非法补货规则拒绝读取" "补货规则非法" "$out"
+fi
+# 合法旧数据（无 rules 字段）按无规则处理并保留原结果
+cat > "$BAD6/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":3}},"entries":[],"docs":{},"reversals":{},
+ "purchases":{},"arrivals":{},"cancels":{},"returns":{}}
+EOF
+out=$(node "$APP" -d "$BAD6" replenish)
+check "旧数据无 rules 字段按无规则处理" "未配置任何补货规则" "$out"
+out=$(node "$APP" -d "$BAD6" balance P9 --wh W)
+check "旧数据原有查询结果保留" "余量：商品 P9 仓库 W = 3" "$out"
 
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
