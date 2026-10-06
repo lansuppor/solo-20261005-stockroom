@@ -88,6 +88,38 @@ interface ReplenishRule {
   target: number; // 目标：补货缺口 = 目标 - 预计量（非负安全整数，恒大于下限）
 }
 
+interface PlanTransfer {
+  docId: string; // 调拨子单编号（库存单据编号空间）
+  pid: string;
+  from: string; // 调拨来源仓
+  to: string; // 目标仓（缺货仓）
+  qty: number; // 冻结调拨量（正安全整数，保存时取自建议，不可改量）
+}
+
+interface PlanPurchase {
+  poId: string; // 采购子单编号（采购编号空间）
+  supplier: string;
+  pid: string;
+  wh: string; // 收货仓（缺货仓）
+  qty: number; // 冻结采购量（正安全整数；零采购缺口不建采购子单）
+}
+
+interface PlanSnapshot {
+  // 涉及商品的全部补货规则（含未触发组合；规则增删改均算变化）
+  rules: Record<string, Record<string, ReplenishRule>>;
+  // 这些配置仓的实存与待到货合计（pending 为精确整数十进制字符串，可超安全整数范围）
+  combos: Record<string, Record<string, { onHand: number; pending: string }>>;
+}
+
+interface ReplenishPlan {
+  input: { transfers: string[]; purchases: { id: string; supplier: string }[] }; // 规范化（排序）保存输入，供同号重放比较
+  transfers: PlanTransfer[]; // 冻结的调拨子单（按建议顺序：商品、目标仓、来源仓升序）
+  purchases: PlanPurchase[]; // 冻结的采购子单（按建议顺序：商品、仓库升序；零采购不占位）
+  snapshot: PlanSnapshot; // 保存时的规则与实存/待到货快照，首次执行前按值核对
+  status: 'pending' | 'executed';
+  resultLines?: string[]; // 执行落单结果（仅已执行），供重放
+}
+
 interface Store {
   version: 1;
   products: Record<string, string>; // 编号 -> 名称（编号区分大小写；null 原型，防特殊键串改）
@@ -100,6 +132,7 @@ interface Store {
   cancels: Record<string, CancelRecord>; // 取消单去重与结果（与库存单共用编号空间，不改库存与流水）
   returns: Record<string, ReturnRecord>; // 退货单去重与结果（与库存单共用编号空间）
   rules: Record<string, Record<string, ReplenishRule>>; // 补货规则：商品 -> 仓库 -> 下限/目标（每组合唯一）
+  plans: Record<string, ReplenishPlan>; // 补货方案（独立编号空间；保存不改库存/采购/流水，不占子单编号）
 }
 
 const REV_ENTRY_TYPES = new Set<EntryType>([
@@ -123,6 +156,7 @@ function emptyStore(): Store {
     cancels: nullProto(),
     returns: nullProto(),
     rules: nullProto(),
+    plans: nullProto(),
   };
 }
 
@@ -668,6 +702,177 @@ function validateStore(data: unknown): Store {
       }
       if (Object.keys(whMap).length === 0) throw bad(`商品 ${pid} 的补货规则为空`);
       store.rules[pid] = whMap;
+    }
+  }
+
+  // plans 为新增字段：合法旧数据没有该字段，按无方案处理。
+  // 方案编号独立于库存单据与采购编号空间；冻结内容、快照与执行状态一并校验，
+  // 已执行方案的子单关联（调拨子单存在于 docs 且内容一致、采购子单存在于
+  // purchases 且内容一致）不符即视为损坏数据，拒绝读取与覆盖。
+  if (data.plans !== undefined) {
+    if (!isPlainObject(data.plans)) throw bad('plans 不是对象');
+    for (const [planId, rec] of Object.entries(data.plans)) {
+      if (typeof planId !== 'string' || planId.trim() === '') throw bad('存在非法方案编号');
+      if (!isPlainObject(rec)) throw bad(`补货方案 ${planId} 的记录非法`);
+
+      // 规范化保存输入（排序后的子单编号与供应商），供同号重放比较
+      if (!isPlainObject(rec.input) || !Array.isArray(rec.input.transfers) || !Array.isArray(rec.input.purchases))
+        throw bad(`补货方案 ${planId} 的保存输入非法`);
+      const inputTransfers: string[] = [];
+      for (const v of rec.input.transfers) {
+        if (typeof v !== 'string' || v.trim() === '') throw bad(`补货方案 ${planId} 的保存输入非法`);
+        inputTransfers.push(v);
+      }
+      const inputPurchases: { id: string; supplier: string }[] = [];
+      for (const v of rec.input.purchases) {
+        if (
+          !isPlainObject(v) ||
+          typeof v.id !== 'string' || v.id.trim() === '' ||
+          typeof v.supplier !== 'string' || v.supplier.trim() === ''
+        )
+          throw bad(`补货方案 ${planId} 的保存输入非法`);
+        inputPurchases.push({ id: v.id, supplier: v.supplier });
+      }
+
+      // 冻结的调拨子单
+      if (!Array.isArray(rec.transfers)) throw bad(`补货方案 ${planId} 的调拨子单非法`);
+      const transfers: PlanTransfer[] = [];
+      for (const t of rec.transfers) {
+        if (
+          !isPlainObject(t) ||
+          typeof t.docId !== 'string' || t.docId.trim() === '' ||
+          typeof t.pid !== 'string' || t.pid.trim() === '' ||
+          typeof t.from !== 'string' || t.from.trim() === '' ||
+          typeof t.to !== 'string' || t.to.trim() === '' ||
+          !isPosSafeInt(t.qty)
+        )
+          throw bad(`补货方案 ${planId} 的调拨子单非法`);
+        if (t.from === t.to) throw bad(`补货方案 ${planId} 的调拨子单调出仓与调入仓相同`);
+        if (store.products[t.pid] === undefined) throw bad(`补货方案 ${planId} 指向未登记商品 ${t.pid}`);
+        transfers.push({ docId: t.docId, pid: t.pid, from: t.from, to: t.to, qty: t.qty });
+      }
+
+      // 冻结的采购子单
+      if (!Array.isArray(rec.purchases)) throw bad(`补货方案 ${planId} 的采购子单非法`);
+      const purchases: PlanPurchase[] = [];
+      for (const p of rec.purchases) {
+        if (
+          !isPlainObject(p) ||
+          typeof p.poId !== 'string' || p.poId.trim() === '' ||
+          typeof p.supplier !== 'string' || p.supplier.trim() === '' ||
+          typeof p.pid !== 'string' || p.pid.trim() === '' ||
+          typeof p.wh !== 'string' || p.wh.trim() === '' ||
+          !isPosSafeInt(p.qty)
+        )
+          throw bad(`补货方案 ${planId} 的采购子单非法`);
+        if (store.products[p.pid] === undefined) throw bad(`补货方案 ${planId} 指向未登记商品 ${p.pid}`);
+        purchases.push({ poId: p.poId, supplier: p.supplier, pid: p.pid, wh: p.wh, qty: p.qty });
+      }
+      if (transfers.length + purchases.length === 0) throw bad(`补货方案 ${planId} 不含任何子单`);
+      // 子单编号在各自空间内不得重复
+      if (new Set(transfers.map((t) => t.docId)).size !== transfers.length)
+        throw bad(`补货方案 ${planId} 的调拨子单编号重复`);
+      if (new Set(purchases.map((p) => p.poId)).size !== purchases.length)
+        throw bad(`补货方案 ${planId} 的采购子单编号重复`);
+
+      // 保存输入必须与冻结子单一一对应（顺序无关）
+      const byId = <T>(arr: T[], key: (v: T) => string): string[] => arr.map(key).sort();
+      if (stableStringify(byId(inputTransfers, (s) => s)) !== stableStringify(byId(transfers, (t) => t.docId)))
+        throw bad(`补货方案 ${planId} 的保存输入与调拨子单不一致`);
+      const purchasePairs = (arr: { id: string; supplier: string }[]): string[] =>
+        arr.map((p) => JSON.stringify([p.id, p.supplier])).sort();
+      if (
+        stableStringify(purchasePairs(inputPurchases)) !==
+        stableStringify(purchasePairs(purchases.map((p) => ({ id: p.poId, supplier: p.supplier }))))
+      )
+        throw bad(`补货方案 ${planId} 的保存输入与采购子单不一致`);
+
+      // 快照：涉及商品的全部补货规则，以及这些配置仓的实存与待到货合计
+      if (!isPlainObject(rec.snapshot) || !isPlainObject(rec.snapshot.rules) || !isPlainObject(rec.snapshot.combos))
+        throw bad(`补货方案 ${planId} 的快照非法`);
+      const snapRules = nullProto<Record<string, Record<string, ReplenishRule>>>();
+      for (const [pid, whs] of Object.entries(rec.snapshot.rules)) {
+        if (typeof pid !== 'string' || pid.trim() === '') throw bad(`补货方案 ${planId} 的快照非法`);
+        if (store.products[pid] === undefined) throw bad(`补货方案 ${planId} 的快照指向未登记商品 ${pid}`);
+        if (!isPlainObject(whs)) throw bad(`补货方案 ${planId} 的快照非法`);
+        const whMap = nullProto<Record<string, ReplenishRule>>();
+        for (const [wh, rule] of Object.entries(whs)) {
+          if (
+            typeof wh !== 'string' || wh.trim() === '' ||
+            !isPlainObject(rule) ||
+            !isNonNegSafeInt(rule.min) || !isNonNegSafeInt(rule.target) || rule.min >= rule.target
+          )
+            throw bad(`补货方案 ${planId} 的快照规则非法`);
+          whMap[wh] = { min: rule.min, target: rule.target };
+        }
+        if (Object.keys(whMap).length === 0) throw bad(`补货方案 ${planId} 的快照规则为空`);
+        snapRules[pid] = whMap;
+      }
+      const snapCombos = nullProto<Record<string, Record<string, { onHand: number; pending: string }>>>();
+      for (const [pid, whs] of Object.entries(rec.snapshot.combos)) {
+        if (!isPlainObject(whs)) throw bad(`补货方案 ${planId} 的快照非法`);
+        const whMap = nullProto<Record<string, { onHand: number; pending: string }>>();
+        for (const [wh, c] of Object.entries(whs)) {
+          if (
+            !isPlainObject(c) ||
+            !isNonNegSafeInt(c.onHand) ||
+            typeof c.pending !== 'string' || !/^\d+$/.test(c.pending)
+          )
+            throw bad(`补货方案 ${planId} 的快照余量非法`);
+          whMap[wh] = { onHand: c.onHand, pending: c.pending };
+        }
+        snapCombos[pid] = whMap;
+      }
+      // 快照规则与快照余量必须覆盖同一组（商品, 仓库）组合
+      if (
+        stableStringify(Object.keys(snapRules).sort()) !== stableStringify(Object.keys(snapCombos).sort()) ||
+        Object.keys(snapRules).some(
+          (pid) =>
+            stableStringify(Object.keys(snapRules[pid]).sort()) !==
+            stableStringify(Object.keys(snapCombos[pid]).sort()),
+        )
+      )
+        throw bad(`补货方案 ${planId} 的快照规则与快照余量组合不一致`);
+
+      if (rec.status !== 'pending' && rec.status !== 'executed')
+        throw bad(`补货方案 ${planId} 的执行状态非法`);
+      const plan: ReplenishPlan = {
+        input: { transfers: inputTransfers, purchases: inputPurchases },
+        transfers, purchases,
+        snapshot: { rules: snapRules, combos: snapCombos },
+        status: rec.status,
+      };
+      if (rec.status === 'executed') {
+        if (!Array.isArray(rec.resultLines) || !rec.resultLines.every((l) => typeof l === 'string'))
+          throw bad(`补货方案 ${planId} 的执行结果非法`);
+        plan.resultLines = rec.resultLines;
+        // 已执行方案的子单关联必须真实存在且内容与冻结一致，否则视为损坏数据
+        for (const t of transfers) {
+          const doc = store.docs[t.docId];
+          if (doc === undefined)
+            throw bad(`已执行补货方案 ${planId} 的调拨子单 ${t.docId} 不存在`);
+          const c = doc.content;
+          const items = c.items as Record<string, unknown>;
+          if (
+            c.type !== 'transfer' || c.from !== t.from || c.to !== t.to ||
+            Object.keys(items).length !== 1 || items[t.pid] !== t.qty
+          )
+            throw bad(`已执行补货方案 ${planId} 的调拨子单 ${t.docId} 内容与冻结方案不一致`);
+        }
+        for (const p of purchases) {
+          const po = store.purchases[p.poId];
+          if (po === undefined)
+            throw bad(`已执行补货方案 ${planId} 的采购子单 ${p.poId} 不存在`);
+          if (
+            po.supplier !== p.supplier || po.wh !== p.wh ||
+            Object.keys(po.ordered).length !== 1 || po.ordered[p.pid] !== p.qty
+          )
+            throw bad(`已执行补货方案 ${planId} 的采购子单 ${p.poId} 内容与冻结方案不一致`);
+        }
+      } else if (rec.resultLines !== undefined) {
+        throw bad(`待执行补货方案 ${planId} 不应携带执行结果`);
+      }
+      store.plans[planId] = plan;
     }
   }
 
@@ -2605,17 +2810,12 @@ interface ReplenishSuggestion {
 }
 
 /**
- * 跨仓补货建议（只读计算，不写文件、不改库存或采购；同状态结果一致）：
- * 每个已配置（商品, 仓库）组合的预计量 = 本仓实存 + 本仓待到货合计
- * （收货仓为本仓的全部采购单：待到货 = 订购 - 有效到货 - 有效取消，不限供应商；
- * 其他仓库存不计入）。预计量不高于下限才触发，缺口 = 目标 - 预计量。
- * 按商品分别分配：同商品其他已配置仓实存超过自身目标的部分可供调拨（待收不可调，
- * 未配置仓既不产生需求也不提供调拨）；缺货仓、来源仓各按标识升序依次取量，
- * 整份建议对来源的累计分配不超过可供量；剩余缺口即采购量。
- * 合计、比较与分配一律用 BigInt 精确整数计算。
+ * 各（商品, 仓库）组合的待到货合计：按采购单收货仓归集（不限供应商），
+ * 待到货 = 订购 - 有效到货 - 有效取消（有效到货 = 未冲销到货 - 未冲销退货，
+ * 有效取消只计未冲销取消）。BigInt 精确累计，超安全整数合计不舍入。
+ * 补货建议与补货方案的快照/核对共用同一份计算。
  */
-function computeReplenish(store: Store): ReplenishSuggestion[] {
-  // 各（商品, 仓库）组合的待到货合计：按采购单收货仓归集（不限供应商）
+function computePendingByCombo(store: Store): Record<string, Record<string, bigint>> {
   const pendingByCombo = nullProto<Record<string, Record<string, bigint>>>();
   for (const poId of Object.keys(store.purchases)) {
     const po = store.purchases[poId];
@@ -2626,6 +2826,21 @@ function computeReplenish(store: Store): ReplenishSuggestion[] {
       byWh[po.wh] = (byWh[po.wh] ?? 0n) + wait;
     }
   }
+  return pendingByCombo;
+}
+
+/**
+ * 跨仓补货建议（只读计算，不写文件、不改库存或采购；同状态结果一致）：
+ * 每个已配置（商品, 仓库）组合的预计量 = 本仓实存 + 本仓待到货合计
+ * （收货仓为本仓的全部采购单：待到货 = 订购 - 有效到货 - 有效取消，不限供应商；
+ * 其他仓库存不计入）。预计量不高于下限才触发，缺口 = 目标 - 预计量。
+ * 按商品分别分配：同商品其他已配置仓实存超过自身目标的部分可供调拨（待收不可调，
+ * 未配置仓既不产生需求也不提供调拨）；缺货仓、来源仓各按标识升序依次取量，
+ * 整份建议对来源的累计分配不超过可供量；剩余缺口即采购量。
+ * 合计、比较与分配一律用 BigInt 精确整数计算。
+ */
+function computeReplenish(store: Store): ReplenishSuggestion[] {
+  const pendingByCombo = computePendingByCombo(store);
 
   const combos: ReplenishSuggestion[] = [];
   for (const pid of Object.keys(store.rules).sort()) {
@@ -2695,6 +2910,286 @@ function runReplenish(rest: string[], store: Store): void {
     }
   }
   if (triggeredCount === 0) console.log('所有组合预计量均高于下限，无缺货，无需补货。');
+}
+
+// ---------- 补货方案：保存、查看与一次性落单 ----------
+
+/** 展示方案：调拨来源、目标仓、商品、数量、采购供应商、子单编号及待执行/已执行状态。 */
+function printPlan(planId: string, plan: ReplenishPlan): void {
+  console.log(
+    `补货方案 ${planId}（${plan.status === 'executed' ? '已执行' : '待执行'}）：` +
+      `调拨 ${plan.transfers.length} 条，采购 ${plan.purchases.length} 条`,
+  );
+  for (const t of plan.transfers)
+    console.log(`  调拨子单 ${t.docId}：商品 ${t.pid}，${t.from} -> ${t.to}，数量 ${t.qty}`);
+  for (const p of plan.purchases)
+    console.log(`  采购子单 ${p.poId}：商品 ${p.pid}，收货仓 ${p.wh}，供应商 ${p.supplier}，数量 ${p.qty}`);
+  if (plan.status === 'executed' && plan.resultLines !== undefined) {
+    console.log('落单结果（执行时的原结果；子单后续冲销、取消或到货不重建）：');
+    for (const l of plan.resultLines) console.log(`  ${l}`);
+  }
+}
+
+/**
+ * 保存补货方案：按当前补货建议的触发、来源分配和采购数量冻结完整方案，
+ * 调用方只为每条调拨及每个正采购缺口指定子单编号（采购项同时指定供应商），
+ * 不能自行改量；零采购缺口不建采购子单，无建议拒绝保存。
+ * 保存只登记方案与快照，不改库存、采购和流水，也不占用子单编号。
+ * 方案编号独立空间：同号同保存输入（明细顺序无关）重放返回原方案、不重新计算；
+ * 同号改输入拒绝。
+ */
+function runPlanSave(tokens: string[], dataDir: string, store: Store): void {
+  const args = parseArgs(tokens, [], ['--transfer', '--purchase']);
+  const [planRaw, ...extra] = args.positionals;
+  if (planRaw === undefined || extra.length > 0)
+    throw new UsageError(
+      '用法：plan save <方案编号> [--transfer <调拨子单编号>]... [--purchase <采购子单编号>:<供应商>]...',
+    );
+  const planId = trimOrThrow('方案编号', planRaw);
+  const transferIds = (args.multi['--transfer'] ?? []).map((s) => trimOrThrow('调拨子单编号', s));
+  const purchaseSpecs = (args.multi['--purchase'] ?? []).map((raw) => {
+    const idx = raw.indexOf(':');
+    if (idx <= 0) throw new BizError(`采购子单格式应为 “子单编号:供应商”：${raw}`);
+    return {
+      id: trimOrThrow('采购子单编号', raw.slice(0, idx)),
+      supplier: trimOrThrow('供应商名称', raw.slice(idx + 1)),
+    };
+  });
+  if (new Set(transferIds).size !== transferIds.length)
+    throw new BizError('调拨子单编号在保存输入中重复，拒绝保存');
+  const poIds = purchaseSpecs.map((p) => p.id);
+  if (new Set(poIds).size !== poIds.length)
+    throw new BizError('采购子单编号在保存输入中重复，拒绝保存');
+
+  // 规范化保存输入（排序，明细顺序无关），供同号重放比较
+  const canonInput = {
+    transfers: [...transferIds].sort(),
+    purchases: purchaseSpecs
+      .map((p) => ({ id: p.id, supplier: p.supplier }))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+  };
+
+  const existed = store.plans[planId];
+  if (existed !== undefined) {
+    if (stableStringify(existed.input) !== stableStringify(canonInput))
+      throw new BizError(`方案编号 ${planId} 已用于保存输入不同的补货方案，拒绝保存`);
+    console.log(`补货方案 ${planId} 已存在，保存输入与原方案一致，返回原方案（不重新计算、不改写数据）：`);
+    printPlan(planId, existed);
+    return;
+  }
+
+  // 冻结当前建议：触发组合、调拨来源分配与采购数量全部取自建议（建议顺序：
+  // 商品、仓库升序；同组合内来源仓升序），数量不得由调用方指定或修改
+  const combos = computeReplenish(store);
+  const triggered = combos.filter((c) => c.triggered);
+  if (triggered.length === 0)
+    throw new BizError('当前无补货建议（没有触发补货的组合），拒绝保存补货方案');
+
+  const transfers: PlanTransfer[] = [];
+  const purchases: PlanPurchase[] = [];
+  for (const c of triggered) {
+    for (const t of c.transfers)
+      transfers.push({ docId: '', pid: c.pid, from: t.from, to: c.wh, qty: Number(t.qty) });
+    if (c.purchase > 0n) {
+      // 零采购缺口不建采购子单；缺口 = 目标 - 预计量 <= 目标，必为正安全整数
+      purchases.push({ poId: '', supplier: '', pid: c.pid, wh: c.wh, qty: Number(c.purchase) });
+    }
+  }
+  if (transferIds.length !== transfers.length || purchaseSpecs.length !== purchases.length)
+    throw new BizError(
+      `当前补货建议共 ${transfers.length} 条调拨与 ${purchases.length} 个正采购缺口，` +
+        `实际提供 ${transferIds.length} 个调拨子单编号与 ${purchaseSpecs.length} 个采购子单，` +
+        '数量不符，拒绝保存（请按 replenish 输出顺序为每条调拨及每个正采购缺口指定子单编号）',
+    );
+  transfers.forEach((t, i) => {
+    t.docId = transferIds[i];
+  });
+  purchases.forEach((p, i) => {
+    p.poId = purchaseSpecs[i].id;
+    p.supplier = purchaseSpecs[i].supplier;
+  });
+
+  // 快照：涉及商品的全部补货规则（含未触发组合），以及这些配置仓的实存与
+  // 待到货合计（精确整数十进制，超安全整数不舍入）；首次执行前按值核对
+  const pendingByCombo = computePendingByCombo(store);
+  const snapRules = nullProto<Record<string, Record<string, ReplenishRule>>>();
+  const snapCombos = nullProto<Record<string, Record<string, { onHand: number; pending: string }>>>();
+  const involved = [...new Set(triggered.map((c) => c.pid))].sort();
+  for (const pid of involved) {
+    const ruleMap = nullProto<Record<string, ReplenishRule>>();
+    const comboMap = nullProto<Record<string, { onHand: number; pending: string }>>();
+    for (const wh of Object.keys(store.rules[pid]).sort()) {
+      const r = store.rules[pid][wh];
+      ruleMap[wh] = { min: r.min, target: r.target };
+      comboMap[wh] = {
+        onHand: getStock(store.stock, pid, wh),
+        pending: (pendingByCombo[pid]?.[wh] ?? 0n).toString(),
+      };
+    }
+    snapRules[pid] = ruleMap;
+    snapCombos[pid] = comboMap;
+  }
+
+  store.plans[planId] = {
+    input: canonInput,
+    transfers,
+    purchases,
+    snapshot: { rules: snapRules, combos: snapCombos },
+    status: 'pending',
+  };
+  saveStore(dataDir, store); // 只登记方案与快照：不改库存、采购和流水，不占用子单编号
+  console.log(`补货方案 ${planId} 保存成功（已冻结当前补货建议；保存不改库存、采购与流水，子单编号待执行时才占用）：`);
+  printPlan(planId, store.plans[planId]);
+}
+
+function runPlanShow(tokens: string[], store: Store): void {
+  const args = parseArgs(tokens, []);
+  const [planRaw, ...extra] = args.positionals;
+  if (planRaw === undefined || extra.length > 0) throw new UsageError('用法：plan show <方案编号>');
+  const planId = trimOrThrow('方案编号', planRaw);
+  const plan = store.plans[planId];
+  if (plan === undefined) throw new BizError(`补货方案 ${planId} 不存在`);
+  printPlan(planId, plan);
+}
+
+/**
+ * 一次性落单：首次执行前按值核对保存时的快照（涉及商品的全部补货规则——
+ * 增删改均算变化——以及这些配置仓的实存与待到货合计），任一变化整案拒绝并
+ * 说明差异，不替换为新建议；无关商品变化不使方案过期。核对通过后按冻结内容
+ * 生成普通调拨单（实际减来源、增目标）和采购单（仅登记待收承诺），子单沿用
+ * 各自编号空间及数量校验；任一拟用编号已被对应空间占用（即使内容相同）整案
+ * 拒绝，不接管已有单据。缺货、溢出或任一子单拒绝均不留下本次库存、采购、
+ * 流水、编号或执行标记，方案保留待执行，条件改善后可重试。全部子单、方案
+ * 关联、执行状态与原结果一次原子保存后才报成功；成功后重放只返回原落单结果。
+ */
+function runPlanExecute(tokens: string[], dataDir: string, store: Store): void {
+  const args = parseArgs(tokens, []);
+  const [planRaw, ...extra] = args.positionals;
+  if (planRaw === undefined || extra.length > 0) throw new UsageError('用法：plan execute <方案编号>');
+  const planId = trimOrThrow('方案编号', planRaw);
+  const plan = store.plans[planId];
+  if (plan === undefined) throw new BizError(`补货方案 ${planId} 不存在`);
+
+  // 已成功执行的方案：直接返回原落单结果，不再核对快照或生效，不改写文件；
+  // 子单后来的冲销、取消或到货不影响本结果，也不重建
+  if (plan.status === 'executed') {
+    console.log(`补货方案 ${planId} 已执行，返回原落单结果（不再核对快照、不再生效，不改写数据）：`);
+    for (const l of plan.resultLines!) console.log(l);
+    return;
+  }
+
+  // 首次执行前按值核对快照：规则增删改、实存或待到货合计变化均整案拒绝
+  const diffs: string[] = [];
+  for (const pid of Object.keys(plan.snapshot.rules)) {
+    const snap = plan.snapshot.rules[pid];
+    const cur = store.rules[pid];
+    for (const wh of Object.keys(snap)) {
+      const c = cur?.[wh];
+      if (c === undefined)
+        diffs.push(`商品 ${pid} 仓库 ${wh} 的补货规则已删除（快照：下限 ${snap[wh].min}，目标 ${snap[wh].target}）`);
+      else if (c.min !== snap[wh].min || c.target !== snap[wh].target)
+        diffs.push(
+          `商品 ${pid} 仓库 ${wh} 的补货规则已变化：下限 ${snap[wh].min} -> ${c.min}，目标 ${snap[wh].target} -> ${c.target}`,
+        );
+    }
+    if (cur !== undefined) {
+      for (const wh of Object.keys(cur)) {
+        if (snap[wh] === undefined)
+          diffs.push(`商品 ${pid} 仓库 ${wh} 新增了补货规则（下限 ${cur[wh].min}，目标 ${cur[wh].target}）`);
+      }
+    }
+  }
+  const pendingByCombo = computePendingByCombo(store);
+  for (const pid of Object.keys(plan.snapshot.combos)) {
+    for (const wh of Object.keys(plan.snapshot.combos[pid])) {
+      const snap = plan.snapshot.combos[pid][wh];
+      const curOnHand = getStock(store.stock, pid, wh);
+      const curPending = (pendingByCombo[pid]?.[wh] ?? 0n).toString();
+      if (curOnHand !== snap.onHand)
+        diffs.push(`商品 ${pid} 仓库 ${wh} 的实存已变化：${snap.onHand} -> ${curOnHand}`);
+      if (curPending !== snap.pending)
+        diffs.push(`商品 ${pid} 仓库 ${wh} 的待到货合计已变化：${snap.pending} -> ${curPending}`);
+    }
+  }
+  if (diffs.length > 0)
+    throw new BizError(
+      `补货方案 ${planId} 保存时的快照与当前状态不一致，整案拒绝执行（方案保留待执行，不替换为新建议）：\n${diffs.join('\n')}`,
+    );
+
+  // 拟用子单编号必须在各自编号空间内空闲：任一已被占用（即使内容相同）整案拒绝，不接管已有单据
+  for (const t of plan.transfers) {
+    if (
+      store.docs[t.docId] !== undefined ||
+      store.reversals[t.docId] !== undefined ||
+      store.arrivals[t.docId] !== undefined ||
+      store.cancels[t.docId] !== undefined ||
+      store.returns[t.docId] !== undefined
+    )
+      throw new BizError(
+        `调拨子单编号 ${t.docId} 已被库存单据编号空间占用，整案拒绝执行（不接管已有单据；方案保留待执行）`,
+      );
+  }
+  for (const p of plan.purchases) {
+    if (store.purchases[p.poId] !== undefined)
+      throw new BizError(
+        `采购子单编号 ${p.poId} 已被采购编号空间占用，整案拒绝执行（不接管已有单据；方案保留待执行）`,
+      );
+  }
+
+  // 按冻结内容一次性落单；任一子单拒绝则本次不留任何痕迹，方案保留待执行
+  const ledger = new Ledger(store);
+  const outLines: string[] = [];
+  try {
+    for (const t of plan.transfers) {
+      const outcome = ledger.applyDoc({
+        type: 'transfer', docId: t.docId, from: t.from, to: t.to,
+        items: new Map([[t.pid, t.qty]]),
+      });
+      outLines.push(outcome.header, ...outcome.lines);
+    }
+    for (const p of plan.purchases) {
+      const outcome = ledger.applyPurchase({
+        poId: p.poId, supplier: p.supplier, wh: p.wh,
+        items: new Map([[p.pid, p.qty]]),
+      });
+      outLines.push(outcome.header, ...outcome.lines);
+    }
+  } catch (e) {
+    if (e instanceof BizError)
+      throw new BizError(
+        `补货方案 ${planId} 执行失败，本次不产生任何库存、采购、流水、编号或执行标记` +
+          `（方案保留待执行，条件改善后可重试）：${e.message}`,
+      );
+    throw e;
+  }
+
+  // 全部子单、方案关联、执行状态与原结果一次原子保存后才报成功
+  plan.status = 'executed';
+  plan.resultLines = outLines;
+  ledger.commit(dataDir);
+  console.log(
+    `补货方案 ${planId} 执行成功：调拨 ${plan.transfers.length} 单、采购 ${plan.purchases.length} 单已落单` +
+      '（子单、方案关联、执行状态与原结果已原子保存）：',
+  );
+  for (const l of outLines) console.log(l);
+}
+
+function runPlan(rest: string[], dataDir: string, store: Store): void {
+  const sub = rest[0];
+  const tokens = rest.slice(1);
+  if (sub === 'save') {
+    runPlanSave(tokens, dataDir, store);
+    return;
+  }
+  if (sub === 'show') {
+    runPlanShow(tokens, store);
+    return;
+  }
+  if (sub === 'execute') {
+    runPlanExecute(tokens, dataDir, store);
+    return;
+  }
+  throw new UsageError(sub === undefined ? '用法：plan <save|show|execute> …' : `未知 plan 子命令：${sub}`);
 }
 
 function runArrival(rest: string[], dataDir: string, store: Store): void {
@@ -2840,6 +3335,10 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   rule list                                 列出全部补货规则
   rule delete <商品编号> --wh <仓库>         删除补货规则
   replenish                                 跨仓补货建议（先用可调拨实存，不足再建议采购；只读）
+  plan save <方案编号> [--transfer <调拨子单编号>]... \\
+            [--purchase <采购子单编号>:<供应商>]...          按当前补货建议冻结并保存补货方案（不改库存/采购/流水）
+  plan show <方案编号>                        查看补货方案（子单、数量、供应商与待执行/已执行状态）
+  plan execute <方案编号>                     一次性落单：核对了快照后按冻结内容生成调拨单与采购单
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
        | --wh <仓库> [--product <编号>]
@@ -2949,6 +3448,29 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   建议查询不写文件、不改变库存或采购，同状态结果一致；合计、比较与分配按精
   确整数计算，超安全整数合计完整十进制显示。
 
+补货方案（保存、查看与一次性落单）：
+  plan save 按当前补货建议的触发、来源分配和采购数量冻结完整方案：为每条
+  调拨及每个正采购缺口各指定一个子单编号（--transfer/--purchase，按
+  replenish 输出顺序一一对应；采购项以 “子单编号:供应商” 同时指定供应商），
+  数量取自建议、不能自行改量；零采购缺口不建采购子单，无建议拒绝保存。
+  保存只登记方案与快照，不改库存、采购和流水，也不占用子单编号。方案编号
+  为独立空间：同号同保存输入（明细顺序无关）重放返回原方案、不重新计算，
+  同号改输入拒绝。保存时记录涉及商品的全部补货规则及这些配置仓的实存与
+  待到货合计快照（待到货按订购减有效到货减有效取消精确计算，超安全整数
+  不舍入）。
+  plan show 展示调拨来源、目标仓、商品、数量、采购供应商、子单编号及待
+  执行/已执行状态。
+  plan execute 首次执行前按值核对快照（规则增删改、实存或待到货合计变化
+  均算变化；无关商品变化不影响），任一变化整案拒绝并说明差异、不替换为
+  新建议。核对通过后按冻结内容一次性生成普通调拨单（实际减来源、增目标）
+  和采购单（仅登记待收承诺）：子单沿用各自编号空间及数量校验，任一拟用
+  编号已被对应空间占用（即使内容相同）整案拒绝、不接管已有单据；缺货、
+  溢出或任一子单拒绝均不留下本次库存、采购、流水、编号或执行标记，方案
+  保留待执行，条件改善后可重试。全部子单、方案关联、执行状态与原结果一
+  次原子保存后才报成功。成功后再执行同方案只返回原落单结果，不再核对快
+  照或生效、不改写文件；子单后来冲销、取消或到货也不重建。落单结果可通
+  过 balance、flow、po show 读回，方案可凭子单编号追溯。
+
 示例：
   node app.ts -d ./data product add P1 螺丝
   node app.ts -d ./data in D1 --wh W1 --item P1:10 --item P2:3
@@ -2971,6 +3493,9 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data rule set P1 --wh W1 --min 5 --target 20
   node app.ts -d ./data rule list
   node app.ts -d ./data replenish
+  node app.ts -d ./data plan save PL1 --transfer T1 --purchase PO9:华东五金
+  node app.ts -d ./data plan show PL1
+  node app.ts -d ./data plan execute PL1
   node app.ts -d ./data rule delete P1 --wh W1
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
@@ -3086,6 +3611,11 @@ function run(argv: string[]): void {
     case 'replenish': {
       const store = loadStore(dataDir);
       runReplenish(tokens, store);
+      break;
+    }
+    case 'plan': {
+      const store = loadStore(dataDir);
+      runPlan(tokens, dataDir, store);
       break;
     }
     case 'flow': {

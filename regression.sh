@@ -216,5 +216,115 @@ check "旧数据无 rules 字段按无规则处理" "未配置任何补货规则
 out=$(node "$APP" -d "$BAD6" balance P9 --wh W)
 check "旧数据原有查询结果保留" "余量：商品 P9 仓库 W = 3" "$out"
 
+echo "== 7. 补货方案：冻结保存、快照核对、一次性落单与重放 =="
+D7="$TMP/data7"
+run7() { node "$APP" -d "$D7" "$@"; }
+run7 product add Q1 螺栓 >/dev/null
+run7 product add Q9 干扰件 >/dev/null
+run7 in E1 --wh W2 --item Q1:15 >/dev/null
+run7 rule set Q1 --wh W1 --min 5 --target 20 >/dev/null
+run7 rule set Q1 --wh W2 --min 2 --target 10 >/dev/null
+# W1：实存 0，缺口 20；W2 可供 5 -> 调拨 5，采购 15
+out=$(run7 plan save PL1 --transfer T1 --purchase PO9:华东五金)
+check "方案保存成功并冻结建议" "补货方案 PL1 保存成功" "$out"
+check "冻结调拨子单（数量取自建议）" "调拨子单 T1：商品 Q1，W2 -> W1，数量 5" "$out"
+check "冻结采购子单（含供应商）" "采购子单 PO9：商品 Q1，收货仓 W1，供应商 华东五金，数量 15" "$out"
+out=$(run7 balance Q1 --wh W2)
+check "保存方案不改库存" "余量：商品 Q1 仓库 W2 = 15" "$out"
+out=$(run7 po show PO9 2>&1)
+check "保存方案不占采购子单编号" "采购单 PO9 不存在" "$out"
+out=$(run7 plan save PL1 --purchase PO9:华东五金 --transfer T1)
+check "同号同输入（顺序无关）重放返回原方案" "返回原方案（不重新计算、不改写数据）" "$out"
+out=$(run7 plan save PL1 --transfer T1 --purchase PO9:其他供应商 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 同号改输入退出码应为 1，实际 $code"; FAIL=1; }
+check "同号改输入拒绝" "已用于保存输入不同的补货方案" "$out"
+out=$(run7 plan save PL2 --transfer T2 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 子单个数不符退出码应为 1，实际 $code"; FAIL=1; }
+check "子单个数不符拒绝并说明所需数量" "共 1 条调拨与 1 个正采购缺口" "$out"
+# 快照核对：规则改/增、实存变、待到货变均整案拒绝；无关商品变化不影响
+run7 rule set Q1 --wh W1 --min 6 --target 20 >/dev/null
+out=$(run7 plan execute PL1 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 快照失配退出码应为 1，实际 $code"; FAIL=1; }
+check "规则变化整案拒绝并说明差异" "仓库 W1 的补货规则已变化：下限 5 -> 6" "$out"
+check "拒绝时提示不替换为新建议" "不替换为新建议" "$out"
+run7 rule set Q1 --wh W1 --min 5 --target 20 >/dev/null
+run7 in E2 --wh W2 --item Q1:1 >/dev/null
+out=$(run7 plan execute PL1 2>&1)
+check "实存变化整案拒绝" "仓库 W2 的实存已变化：15 -> 16" "$out"
+run7 out E3 --wh W2 --item Q1:1 >/dev/null
+run7 po register POX --supplier S --wh W1 --item Q1:2 >/dev/null
+out=$(run7 plan execute PL1 2>&1)
+check "待到货合计变化整案拒绝" "仓库 W1 的待到货合计已变化：0 -> 2" "$out"
+run7 cancel CX --po POX --item Q1:2 >/dev/null
+run7 in E4 --wh W1 --item Q9:9 >/dev/null
+run7 rule set Q9 --wh W1 --min 1 --target 2 >/dev/null
+out=$(run7 plan show PL1)
+check "快照失配后方案保留待执行" "（待执行）" "$out"
+# 子单编号被对应空间占用（用无关商品占位，不动快照）：整案拒绝、不接管已有单据
+run7 in T1 --wh W9 --item Q9:1 >/dev/null
+out=$(run7 plan execute PL1 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 编号占用退出码应为 1，实际 $code"; FAIL=1; }
+check "拟用编号被占用整案拒绝" "调拨子单编号 T1 已被库存单据编号空间占用" "$out"
+out=$(run7 plan show PL1)
+check "占用拒绝后方案保留待执行" "（待执行）" "$out"
+out=$(run7 po show PO9 2>&1)
+check "占用拒绝不留采购子单" "采购单 PO9 不存在" "$out"
+out=$(run7 balance Q1 --wh W1)
+check "占用拒绝不改库存" "余量：商品 Q1 仓库 W1 = 0" "$out"
+# 编号一旦占用不会释放（T1 已被占），改用另一方案编号与新子单编号验证成功落单
+run7 plan save PL3 --transfer T3 --purchase PO7:华东五金 >/dev/null
+out=$(run7 plan execute PL3)
+check "快照一致且编号空闲时落单成功" "补货方案 PL3 执行成功：调拨 1 单、采购 1 单已落单" "$out"
+check "调拨实际减来源增目标" "调拨 Q1 W2 -> W1 5：W2 15->10；W1 0->5" "$out"
+out=$(run7 balance Q1 --wh W1)
+check "落单后目标仓余量可读回" "余量：商品 Q1 仓库 W1 = 5" "$out"
+out=$(run7 po show PO7)
+check "采购子单仅登记待收承诺" "Q1	15	0	15	未到货" "$out"
+out=$(run7 flow --product Q1 --wh W1)
+check "流水可读回调拨子单" "单据=T3	调拨" "$out"
+out=$(run7 plan execute PL3)
+check "执行后再执行返回原落单结果" "已执行，返回原落单结果（不再核对快照、不再生效，不改写数据）" "$out"
+# 子单后来冲销不影响已执行方案的重放与重载
+run7 reverse RV3 --orig T3 >/dev/null
+out=$(run7 plan execute PL3)
+check "子单冲销后重放仍返回原结果" "返回原落单结果" "$out"
+out=$(run7 plan show PL3)
+check "已执行状态持久（新进程重载）" "（已执行）" "$out"
+# 无建议拒绝保存
+out=$(run7 plan save PL9 --transfer T9 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 无建议退出码应为 1，实际 $code"; FAIL=1; }
+check "无建议拒绝保存" "当前无补货建议" "$out"
+# 用法错误退出 2
+out=$(run7 plan save 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - plan save 缺参数退出码应为 2，实际 $code"; FAIL=1; }
+out=$(run7 plan bogus 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - 未知 plan 子命令退出码应为 2，实际 $code"; FAIL=1; }
+# 损坏方案（已执行方案子单关联缺失）拒读拒写
+BAD7="$TMP/bad7"
+mkdir -p "$BAD7"
+cat > "$BAD7/stockroom.json" <<'EOF'
+{"version":1,"products":{"Q1":"x"},"stock":{"Q1":{"W1":5,"W2":10}},
+ "entries":[{"seq":1,"doc":"T3","type":"transfer","product":"Q1","wh":"W2","qty":5,"before":15,"after":10,"from":"W2","to":"W1"},
+            {"seq":2,"doc":"T3","type":"transfer","product":"Q1","wh":"W1","qty":5,"before":0,"after":5,"from":"W2","to":"W1"}],
+ "docs":{"T3":{"content":{"type":"transfer","from":"W2","to":"W1","items":{"Q1":5}},"resultLines":["x"]}},
+ "reversals":{},"purchases":{},"arrivals":{},"cancels":{},"returns":{},
+ "rules":{"Q1":{"W1":{"min":5,"target":20},"W2":{"min":2,"target":10}}},
+ "plans":{"PL3":{"input":{"transfers":["T3"],"purchases":[{"id":"PO7","supplier":"S"}]},
+   "transfers":[{"docId":"T3","pid":"Q1","from":"W2","to":"W1","qty":5}],
+   "purchases":[{"poId":"PO7","supplier":"S","pid":"Q1","wh":"W1","qty":15}],
+   "snapshot":{"rules":{"Q1":{"W1":{"min":5,"target":20},"W2":{"min":2,"target":10}}},
+               "combos":{"Q1":{"W1":{"onHand":0,"pending":"0"},"W2":{"onHand":15,"pending":"0"}}}},
+   "status":"executed","resultLines":["x"]}}}
+EOF
+out=$(node "$APP" -d "$BAD7" plan show PL3 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 已执行方案子单关联缺失应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "已执行方案子单关联缺失拒读" "采购子单 PO7 不存在" "$out"
+fi
+# 旧数据（无 plans 字段）直接可用并保留历史结果
+out=$(node "$APP" -d "$BAD6" plan show PL0 2>&1)
+check "旧数据无 plans 字段按无方案处理" "补货方案 PL0 不存在" "$out"
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
