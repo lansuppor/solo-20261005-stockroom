@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // stockroom —— 本地多仓库存台账（Node.js 24，TypeScript，无外部运行依赖）
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import type { Stats } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { connect as netConnect } from 'node:net';
+import { Worker } from 'node:worker_threads';
+import { createHash } from 'node:crypto';
 
 const APP_NAME = 'stockroom';
 const DATA_FILENAME = 'stockroom.json';
@@ -1122,13 +1127,41 @@ function validateStore(data: unknown): Store {
   return store;
 }
 
+/**
+ * 保存：写唯一临时文件再原子 rename。临时文件名含进程号与进程内序号，同一进程
+ * 连续多次保存（批处理场景）也不会互相覆盖；崩溃遗留的临时文件由后续取得写入
+ * 机会者按“进程已退出”清理，绝不动存活进程的临时文件。
+ *
+ * STOCKROOM_CRASH_AT 仅供本地回归注入 SIGKILL（正常使用永不设置）：
+ *   before-tmp  写临时文件之前被杀 -> 本次完全不生效
+ *   tmp-written 写完临时文件、原子替换之前被杀 -> 本次不生效，遗留临时内容
+ *   renamed     原子替换之后被杀 -> 完整提交已保留，重试按去重返回原结果
+ */
+const CRASH_ENV = 'STOCKROOM_CRASH_AT';
+let tmpFileSeq = 0;
+
+function crashPoint(stage: 'before-tmp' | 'tmp-written' | 'renamed'): void {
+  if (process.env[CRASH_ENV] === stage) {
+    try {
+      process.kill(process.pid, 'SIGKILL');
+    } catch {
+      /* 极端情况下信号失败：停在此处，保持与被杀等效的不确定状态 */
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+  }
+}
+
 function saveStore(dataDir: string, store: Store): void {
   const path = dataPath(dataDir);
-  const tmp = join(dataDir, `.${DATA_FILENAME}.${process.pid}.tmp`);
+  tmpFileSeq += 1;
+  const tmp = join(dataDir, `.${DATA_FILENAME}.${process.pid}.${tmpFileSeq}.tmp`);
   try {
     mkdirSync(dataDir, { recursive: true });
+    crashPoint('before-tmp');
     writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', 'utf8');
+    crashPoint('tmp-written');
     renameSync(tmp, path);
+    crashPoint('renamed');
   } catch (e) {
     throw new DataError(`保存数据失败，已有数据保持不变：${(e as Error).message}`);
   }
@@ -1136,31 +1169,64 @@ function saveStore(dataDir: string, store: Store): void {
 
 // ---------- 多进程写入协调 ----------
 //
-// 同一数据目录的写请求用目录内的锁文件串行化：取得写入机会后才读取最新已提交
-// 状态，业务校验、去重与原子保存（临时文件 + rename）都在持有锁期间完成，因此
-// 并发请求的最终结果等价于某个完整串行执行顺序，流水序号与该顺序一致。锁文件
-// 位于数据目录内部，相对、绝对及符号链接路径指向同一目录时自然共用同一把锁；
-// 不同目录各有自己的锁，互不阻塞。只读查询不创建也不检查锁文件。
+// 同一数据目录的写请求通过目录内的一个 UNIX 域套接字互斥：占用者在独立 worker
+// 线程里监听该套接字并立即接受连接，内核保证同一时刻只有一个监听者。取得写入
+// 机会后才读取最新已提交状态，业务校验、去重与原子保存（临时文件 + rename）都
+// 在占用期间完成，因此并发请求的最终结果等价于某个完整串行执行顺序，流水序号
+// 与该顺序一致。套接字位于数据目录内部，相对、绝对及符号链接路径指向同一目录
+// 时自然共用同一个协调点；不同目录各有各的协调点，互不阻塞。只读查询不创建也
+// 不检查任何协调文件。
 //
-// 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按毫秒调整），
-// 超时明确报错并以退出码 1 结束。写进程异常退出（如被 kill）会留下锁文件：
-// 后续写请求发现锁中记录的进程号已不存在时自动接管，无需手工删除任何文件；
-// 仍存活的写进程无论写多久都不会被抢占。
+// 为什么不用“锁文件 + 文件年龄/PID 内容”：文件年龄无法区分“占用者仍存活但
+// 暂停”与“异常退出后的遗留”，占用者信息又可能尚未写完，二者都会导致存活写
+// 进程被误接管。UNIX 域套接字的占用状态由内核维护：
+//   - 占用者进程存活（即使主线程暂停、信息未输出）时，其 worker 仍在接受连接，
+//     connect 立即成功，任何等待者都只能等待，绝不因年龄或内容被接管；
+//   - 占用者进程异常退出（如被 SIGKILL）时，内核自动关闭监听，connect 立即
+//     失败，后续请求据此回收遗留套接字并自行占用，全程无需手工删除任何文件。
+// 回收采用“改名后再次探活”：只有被移走的套接字仍连不上才确认无主；若移走后
+// 能连上（说明属于存活进程）立即改名还原，因此绝不会移走另一个请求刚取得的
+// 占用。多个请求同时发现遗留占用时，最终的唯一监听者由内核裁决，天然串行。
+//
+// 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按非负安全整数
+// 毫秒调整；0 表示仅立即尝试一次），配置非法在等待前以退出码 2 报错，绝不会
+// 变成无限等待；超时向标准错误报告“数据目录正忙”并以退出码 1 结束。
 
 const LOCK_FILENAME = `.${DATA_FILENAME}.lock`;
 const LOCK_TMP_PREFIX = `.${DATA_FILENAME}.`;
 const LOCK_WAIT_DEFAULT_MS = 10_000;
+const LOCK_WAIT_ENV = 'STOCKROOM_LOCK_WAIT_MS';
 const LOCK_POLL_MS = 50;
-const LOCK_UNREADABLE_FRESH_MS = 2_000; // 内容尚未写入的锁在此宽限内视为“刚创建”，不抢占
+const LOCK_PROBE_TIMEOUT_MS = 250; // 探活上限：超时按“仍存活”保守处理，绝不接管
+const LOCK_BACKLOG = 1024;
+// macOS 上 UNIX 域路径上限约 104 字节，Linux 约 108；预留余量后超长则回退到
+// 系统临时目录，以数据目录真实路径的哈希命名，同一目录的各种写法仍共用一点。
+const LOCK_IN_DIR_MAX_PATH = 100;
+const LOCK_FALLBACK_PREFIX = `.stockroom.lock.`;
+let releaseSeq = 0;
 
 interface WriteLock {
-  release(): void;
+  release(): Promise<void>;
 }
 
+class LockConfigError extends Error {} // 等待配置非法 -> 退出码 2（等待前报错）
+
+/** 解析等待上限：未设置取默认值；必须是非负安全整数毫秒，非法在等待前报错退出 2。 */
 function lockWaitLimitMs(): number {
-  const raw = process.env.STOCKROOM_LOCK_WAIT_MS;
-  if (raw !== undefined && /^\d+$/.test(raw)) return Number(raw);
-  return LOCK_WAIT_DEFAULT_MS;
+  const raw = process.env[LOCK_WAIT_ENV];
+  if (raw === undefined) return LOCK_WAIT_DEFAULT_MS;
+  if (!/^\d+$/.test(raw.trim()))
+    throw new LockConfigError(
+      `环境变量 ${LOCK_WAIT_ENV} 必须是非负安全整数毫秒（0 表示仅立即尝试一次），实际为：${raw}`,
+    );
+  const n = Number(raw.trim());
+  if (!Number.isSafeInteger(n) || n < 0)
+    throw new LockConfigError(`环境变量 ${LOCK_WAIT_ENV} 超出安全整数范围，拒绝启动：${raw}`);
+  return n;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function pidAlive(pid: number): boolean {
@@ -1172,108 +1238,319 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function statOrNull(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
 }
 
 /**
- * 读取现存锁文件并判断是否属于已退出的写进程：返回锁文件原文表示可安全接管；
- * 返回 null 表示锁被存活进程持有（或刚好被释放/替换，下一轮重试即可）。
- * 内容尚不可解析的锁视为“刚创建、内容未写完”，短暂宽限内不抢占，超过宽限按
- * 异常遗留处理。
+ * 协调套接字实际路径。按数据目录“真实路径”的长度决定，保证同一目录的相对、
+ * 绝对与符号链接写法一定落到同一个协调点：
+ *   - 真实路径足够短时放在数据目录内（经任意写法访问都指向同一文件对象）；
+ *   - 超过内核 UNIX 域路径上限时回退到系统临时目录，按真实路径哈希命名。
  */
-function staleLockContent(path: string): string | null {
+function lockPathFor(dataDir: string): string {
+  let real: string;
+  try {
+    real = realpathSync(dataDir);
+  } catch {
+    real = dataDir;
+  }
+  if (join(real, LOCK_FILENAME).length <= LOCK_IN_DIR_MAX_PATH) return join(dataDir, LOCK_FILENAME);
+  return join(
+    tmpdir(),
+    LOCK_FALLBACK_PREFIX + createHash('sha256').update(real).digest('hex').slice(0, 24) + '.sock',
+  );
+}
+
+/**
+ * 探活一个 UNIX 域套接字：
+ *   'alive'   成功连上 -> 有存活占用者；
+ *   'dead'    明确拒绝/不存在 -> 无监听者，可回收；
+ *   'unknown' 超时或其他瞬时错误 -> 保守视为存活，不接管。
+ */
+function probeSocket(path: string, timeoutMs = LOCK_PROBE_TIMEOUT_MS): Promise<'alive' | 'dead' | 'unknown'> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r: 'alive' | 'dead' | 'unknown'): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        sock.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(r);
+    };
+    const sock = netConnect({ path });
+    sock.once('connect', () => done('alive'));
+    sock.once('error', (e) => done(['ECONNREFUSED', 'ENOENT'].includes((e as NodeJS.ErrnoException).code ?? '') ? 'dead' : 'unknown'));
+    setTimeout(() => done('unknown'), timeoutMs).unref();
+  });
+}
+
+// 占用者 worker：独立线程持有监听套接字并立即接受连接。即便主线程暂停（例如
+// 业务处理中被挂起超过两秒），worker 仍持续排空监听队列，等待者探活始终成功，
+// 因此存活进程绝不会因年龄或内容不完整被接管。进程整体被杀时 worker 一同消失，
+// 内核关闭监听，等待者自动转入回收。
+//
+// worker 必须健壮到“绝不自行退出”：接受的连接立即销毁且吞掉一切错误（探活方
+// 连上即断可能产生 ECONNRESET），并守住未捕获异常。否则 worker 线程一旦在占用
+// 期间意外终止，主线程仍以为持锁、内核却已关闭监听，等待者会把仍在办理业务的
+// 存活进程误判为无主而接管，造成两个占用者并发提交、互相覆盖。
+const LOCK_WORKER_CODE = `
+const { parentPort, workerData } = require('node:worker_threads');
+const net = require('node:net');
+process.on('uncaughtException', () => {});
+process.on('unhandledRejection', () => {});
+const server = net.createServer((conn) => { conn.on('error', () => {}); conn.destroy(); });
+server.on('error', (e) => { try { parentPort.postMessage({ type: 'error', code: e.code }); } catch {} });
+server.listen({ path: workerData.path, exclusive: true, backlog: ${LOCK_BACKLOG} },
+  () => { try { parentPort.postMessage({ type: 'ready' }); } catch {} });
+parentPort.on('message', (m) => {
+  if (m === 'release') server.close(() => { try { parentPort.postMessage({ type: 'closed' }); } catch {} });
+});
+`;
+
+/**
+ * 尝试在 path 上立即建立占用。成功返回 WriteLock；path 已被占用（EADDRINUSE）
+ * 返回 null；其他错误按数据/环境故障抛出。占用期间 worker 持续接受探活连接。
+ */
+function tryListen(path: string): Promise<WriteLock | null> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(LOCK_WORKER_CODE, { eval: true, workerData: { path } });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        worker.terminate();
+        reject(new DataError(`无法获取数据目录写入机会（建立协调套接字超时）：${path}`));
+      }
+    }, 2_000);
+    timer.unref();
+    worker.once('message', (m: { type: string; code?: string }) => {
+      if (settled) return;
+      if (m.type === 'ready') {
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          async release(): Promise<void> {
+            // 释放只“关闭监听”，绝不改名或删除路径。
+            //
+            // UNIX 域套接字互斥的是路径名而非 inode：若在监听仍存活时把路径改名
+            // 移走（或先 unlink），另一进程会立刻在原路径成功 bind 新套接字，于是
+            // 出现两个并存的监听者（经典 unlink 竞态）。因此本进程的业务提交完成
+            // 后，只关闭自己的监听：此后该路径指向一个“已无监听的套接字”，等待者
+            // 探活为死，由它统一把这条已死路径改名回收后再占用（reclaimDeadSocket
+            // 只改名确认无监听的路径，不会造成双监听）。本进程绝不动路径，也就绝不
+            // 可能删除后继占用者刚建立的新套接字。
+            await new Promise<void>((res) => {
+              const t = setTimeout(res, 1_000).unref(); // 关闭确认有界，避免极端情况下挂起整个进程
+              worker.once('message', (mm: { type: string }) => {
+                if (mm.type === 'closed') {
+                  clearTimeout(t);
+                  res();
+                }
+              });
+              worker.postMessage('release');
+            });
+            await worker.terminate().catch(() => {});
+          },
+        });
+      } else if (m.type === 'error') {
+        settled = true;
+        clearTimeout(timer);
+        worker.terminate();
+        // macOS 上两个进程同时 bind 同一新路径时，负方可能返回 EADDRINUSE 或
+        // EEXIST：都表示“已有占用者/竞争失败”，按未获得写入机会处理并重试。
+        if (m.code === 'EADDRINUSE' || m.code === 'EEXIST') resolve(null);
+        else reject(new DataError(`无法获取数据目录写入机会（协调套接字错误 ${m.code ?? '?'}）：${path}`));
+      }
+    });
+    worker.once('error', (e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new DataError(`无法获取数据目录写入机会：${e.message}`));
+    });
+  });
+}
+
+/**
+ * 取得写入机会后清理遗留物；其他存活进程的文件一律不动：
+ *  - 数据临时文件 .stockroom.json.<pid>[.<seq>].tmp（总在数据目录内）；
+ *  - 回收者异常退出时遗留的短名套接字 .sr.<pid>.<seq>.<rand>（在协调套接字所在
+ *    目录；路径过长回退到系统临时目录时也在那里）。这类条目只可能是已确认无监听、
+ *    被改名移走的死套接字，配合严格命名格式与进程号判定可安全删除。
+ */
+const RECLAIM_PREFIX = '.sr.';
+
+function cleanStaleTmpFiles(dataDir: string, lockPath: string): void {
+  const removeIfDead = (dir: string, name: string, pidSegment: string, radix: number): void => {
+    const pid = Number.parseInt(pidSegment, radix);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pidAlive(pid)) return;
+    try {
+      unlinkSync(join(dir, name));
+    } catch {
+      /* 清理失败不影响本次写入 */
+    }
+  };
+  let dataNames: string[];
+  try {
+    dataNames = readdirSync(dataDir);
+  } catch {
+    dataNames = [];
+  }
+  for (const name of dataNames) {
+    if (name.startsWith(LOCK_TMP_PREFIX) && name.endsWith('.tmp')) {
+      // 临时名形如 .stockroom.json.<pid>[.<seq>].tmp，取首个十进制数字段判断存活
+      removeIfDead(dataDir, name, name.slice(LOCK_TMP_PREFIX.length, -'.tmp'.length), 10);
+    }
+  }
+  // 回收副本位于协调套接字所在目录（可能是数据目录，也可能是回退的系统临时目录）
+  const coordDir = dirname(lockPath);
+  let coordNames: string[];
+  try {
+    coordNames = coordDir === dataDir ? dataNames : readdirSync(coordDir);
+  } catch {
+    return;
+  }
+  for (const name of coordNames) {
+    // 严格匹配 .sr.<pid(base36)>.<seq(base36)>.<rand>，避免误删系统临时目录中的无关文件
+    const parts = name.split('.');
+    if (parts.length !== 5 || parts[0] !== '' || parts[1] !== 'sr') continue;
+    if (!/^[0-9a-z]+$/.test(parts[2]) || !/^[0-9a-z]+$/.test(parts[3]) || !/^[0-9a-z]+$/.test(parts[4])) continue;
+    removeIfDead(coordDir, name, parts[2], 36);
+  }
+}
+
+/**
+ * 构造同目录内的“回收临时项”短路径。UNIX 域套接字有路径长度上限（macOS 约
+ * 104、Linux 约 108），而回收需要把套接字改名后再 connect 复核，因此临时项必须
+ * 比协调套接字本身更短——凡能成功建立监听的锁路径，其回收项也一定可 connect。
+ * 名字带进程号、序号与随机段，避免多个回收者或与数据临时文件冲突。
+ */
+function reclaimPathFor(lockPath: string): string {
+  const name =
+    `${RECLAIM_PREFIX}${process.pid.toString(36)}.${(++releaseSeq).toString(36)}.${Math.random().toString(36).slice(2, 6)}`;
+  return join(dirname(lockPath), name);
+}
+
+/** 回收旧版本遗留的普通锁文件：仅当其记录的进程已不存在（或无法解析）时移走。 */
+async function reclaimLegacyLockFile(path: string): Promise<boolean> {
   let content: string;
   try {
     content = readFileSync(path, 'utf8');
   } catch {
-    return null;
+    return false; // 已被别人处理
   }
-  const m = /^(\d+) /.exec(content);
-  if (m !== null) return pidAlive(Number(m[1])) ? null : content;
+  const m = /^(\d+)/.exec(content);
+  if (m !== null && pidAlive(Number(m[1]))) return false; // 旧版本占用者仍存活：等待
   try {
-    return Date.now() - statSync(path).mtimeMs > LOCK_UNREADABLE_FRESH_MS ? content : null;
+    // 普通锁文件没有监听者，PID 存活性已挡住误删，可直接删除（无需改名复核）
+    unlinkSync(path);
+    return true;
   } catch {
-    return null;
-  }
-}
-
-/** 清理异常退出写进程遗留的临时文件；其他存活写入的临时文件一律不动。 */
-function cleanStaleTmpFiles(dataDir: string): void {
-  let names: string[];
-  try {
-    names = readdirSync(dataDir);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (!name.startsWith(LOCK_TMP_PREFIX) || !name.endsWith('.tmp')) continue;
-    const pid = Number(name.slice(LOCK_TMP_PREFIX.length, -'.tmp'.length));
-    if (!Number.isInteger(pid) || pid <= 0 || pidAlive(pid)) continue;
-    try {
-      unlinkSync(join(dataDir, name));
-    } catch {
-      /* 清理失败不影响本次写入 */
-    }
+    return false;
   }
 }
 
 /**
- * 获取数据目录的写入机会（有限等待 + 异常退出自动恢复）。成功返回后调用方独占
- * 该目录的写权限，必须在 finally 中 release()；结束或失败都会释放占用。
+ * 回收一个已无监听者的套接字：用同目录短名改名移走后再次 connect 复核。只有
+ * 持续连不上（dead）才确认无主并删除；若改名后能连上（alive）说明属于存活占用
+ * 者，立即改名还原并返回 false；偶发无响应（unknown）再复核若干次，期间任一
+ * 次为存活即还原，全部无响应/拒绝才确认。返回 true 表示原协调点已清空，可立即
+ * 占用。短名保证改名后的套接字路径仍在系统长度上限内，复核不会因路径过长而
+ * 假性无响应。
  */
-function acquireWriteLock(dataDir: string): WriteLock {
-  const limit = lockWaitLimitMs();
-  const deadline = Date.now() + limit;
-  const path = join(dataDir, LOCK_FILENAME);
-  const content = `${process.pid} ${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}\n`;
+async function reclaimDeadSocket(path: string): Promise<boolean> {
+  const trash = reclaimPathFor(path);
   try {
-    mkdirSync(dataDir, { recursive: true }); // 首次使用：先建目录再竞争锁，并发创建同样安全
+    renameSync(path, trash);
+  } catch {
+    return false; // 别人已抢先回收或占用者已自行释放：下一轮重新判断
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await probeSocket(trash, LOCK_PROBE_TIMEOUT_MS);
+    if (r === 'alive') {
+      try {
+        renameSync(trash, path); // 存活占用：原样还原，绝不接管
+      } catch {
+        /* 原路径已被占用者或他人重建：无法还原时也绝不删除该套接字 */
+      }
+      return false;
+    }
+    if (r === 'dead') {
+      try {
+        unlinkSync(trash);
+      } catch {
+        /* 删除失败下一轮会再次回收 */
+      }
+      return true;
+    }
+    // unknown：短暂让出事件循环后再次复核，避免把瞬时无响应误判为无主
+    sleepSync(20);
+  }
+  // 连续多次无响应：保守还原，不在本次回收，等待后续请求处理
+  try {
+    renameSync(trash, path);
+  } catch {
+    /* 无法还原时保留短名副本，绝不删除 */
+  }
+  return false;
+}
+
+/**
+ * 获取数据目录的写入机会（有限等待 + 异常退出自动恢复）。成功返回后调用方独占
+ * 该目录的写权限，必须在 finally 中 await release()；结束或失败都会释放自己的
+ * 占用，绝不删除别人的占用。
+ */
+async function acquireWriteLock(dataDir: string, limit: number): Promise<WriteLock> {
+  const deadline = Date.now() + limit;
+  try {
+    mkdirSync(dataDir, { recursive: true }); // 首次使用：先建目录再竞争，并发创建同样安全
   } catch (e) {
     throw new DataError(`无法创建数据目录 ${dataDir}：${(e as Error).message}`);
   }
+  const path = lockPathFor(dataDir);
+
   for (;;) {
+    let st: Stats | null;
     try {
-      writeFileSync(path, content, { flag: 'wx' }); // 原子创建：已存在即失败
-      cleanStaleTmpFiles(dataDir);
-      let released = false;
-      return {
-        release(): void {
-          if (released) return;
-          released = true;
-          try {
-            // 仅当锁仍由本请求持有时删除，绝不错删其他写进程的锁
-            if (readFileSync(path, 'utf8') === content) unlinkSync(path);
-          } catch {
-            /* 锁已被接管或目录不可用：忽略 */
-          }
-        },
-      };
+      st = statOrNull(path);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new DataError(`无法获取数据目录写入机会（创建锁文件失败）：${(e as Error).message}`);
-      }
+      throw new DataError(`无法访问协调套接字 ${path}：${(e as Error).message}`);
     }
-    const stale = staleLockContent(path);
-    if (stale !== null) {
-      // 写进程已异常退出：把遗留锁改名移走后重试。改名前重新比对原文，避免误移走
-      // 另一请求刚获得的新锁；改名竞争失败（他人已处理）时下一轮自然重试。
-      try {
-        if (readFileSync(path, 'utf8') === stale) {
-          const trash = `${path}.stale.${process.pid}`;
-          try {
-            renameSync(path, trash);
-            unlinkSync(trash);
-          } catch {
-            /* 其他请求已处理该遗留锁 */
-          }
+
+    let acquired: WriteLock | null = null;
+    if (st === null) {
+      acquired = await tryListen(path); // 内核裁决：唯一监听者即占用者
+    } else if (st.isSocket()) {
+      // 连续两次判死才回收，两次背靠背立即探活：占用者 worker 一旦在监听，内核
+      // 对 connect 立即应答，两次都会成功；真正异常退出的监听两次都拒绝。
+      // 超时（unknown）一律按存活等待，绝不接管。
+      const r1 = await probeSocket(path);
+      if (r1 === 'dead') {
+        const r2 = await probeSocket(path);
+        if (r2 === 'dead' && (await reclaimDeadSocket(path))) {
+          acquired = await tryListen(path); // 已确认无监听并清空路径：立即占用
         }
-      } catch {
-        /* 锁已被释放或替换：直接重试 */
       }
-      continue;
+    } else {
+      // 非套接字（旧版本锁文件等）：仅当确认其记录的进程已退出才移走；存活则等待
+      if (await reclaimLegacyLockFile(path)) acquired = await tryListen(path);
     }
-    if (Date.now() >= deadline) {
+
+    if (acquired !== null) {
+      cleanStaleTmpFiles(dataDir, path);
+      return acquired;
+    }
+
+    if (limit === 0 || Date.now() >= deadline) {
       throw new DataError(
         `数据目录正忙：等待写入机会超过 ${limit} 毫秒仍未获得（另一进程正在写入 ${dataDir}）；` +
           `本次请求未做任何改动，请稍后重试`,
@@ -1544,7 +1821,6 @@ function parseTransferArgs(tokens: string[]): TransferRequest {
 }
 
 // ---------- 整批导入文件解析 ----------
-
 type ImportRequest =
   | { kind: 'doc'; req: DocRequest }
   | { kind: 'count'; req: CountRequest }
@@ -3575,16 +3851,22 @@ function runRecon(rest: string[], store: Store): void {
   }
 }
 
-function runReverse(rest: string[], dataDir: string, store: Store): void {
+/** 纯命令行解析 reverse 参数（等待前预检与正式执行共用）；业务校验仍在取得写入机会后。 */
+function parseReverseArgs(rest: string[]): { revId: string; origId: string } {
   const args = parseArgs(rest, ['--orig']);
   const revRaw = args.positionals[0];
   if (revRaw === undefined || args.positionals.length !== 1)
     throw new UsageError('用法：reverse <冲销单编号> --orig <原单编号>');
   if (args.flags['--orig'] === undefined)
     throw new UsageError('冲销必须通过 --orig <原单编号> 指定被冲销的原单');
-  const revId = trimOrThrow('冲销单编号', revRaw);
-  const origId = trimOrThrow('原单编号', args.flags['--orig']);
-  const ledger = new Ledger(store);
+  return {
+    revId: trimOrThrow('冲销单编号', revRaw),
+    origId: trimOrThrow('原单编号', args.flags['--orig']),
+  };
+}
+
+function runReverse(rest: string[], dataDir: string, store: Store): void {
+  const { revId, origId } = parseReverseArgs(rest);  const ledger = new Ledger(store);
   const outcome = ledger.applyReversal(revId, origId);
   ledger.commit(dataDir);
   if (outcome.duplicate) {
@@ -4717,10 +4999,13 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   空白后非空、区分大小写。
 
 多进程协调：
-  同一数据目录的写命令自动串行执行（目录内锁文件，取得写入机会后才读取最新
-  已提交状态；等待上限默认 10 秒，可用 STOCKROOM_LOCK_WAIT_MS 按毫秒调整，
-  超时报告“数据目录正忙”并退出 1）。写进程异常退出后由后续写请求自动恢复，
-  无需手工删除文件；只读查询不参与协调，不创建协调文件。
+  同一数据目录的写命令自动串行执行（数据目录内的 UNIX 域协调套接字
+  .stockroom.json.lock，由独立工作线程持监听；取得写入机会后才读取最新已提交
+  状态）。等待上限默认 10 秒，可用 STOCKROOM_LOCK_WAIT_MS 设为非负安全整数
+  毫秒（0 表示仅立即尝试一次），非法配置在等待前报错并退出 2，绝不转成无限
+  等待；超时报告“数据目录正忙”并退出 1。存活写进程无论暂停多久都不会被接管；
+  异常退出后由后续写请求经内核无监听判定自动串行回收，无需手工删除文件。
+  用法/格式错误与等待配置错误在等待前退出 2；只读查询不参与协调，不创建协调文件。
 
 采购与到货规则：
   po register 登记采购单（编号、供应商、收货仓及至少一种已登记商品的订购量），
@@ -4968,7 +5253,112 @@ function isWriteCommand(cmd: string, tokens: string[]): boolean {
   }
 }
 
-function run(argv: string[]): void {
+/**
+ * 等待前的纯命令行预检：只校验仅凭命令行（及导入文件本身）即可判断的用法/格式，
+ * 不读取台账、不需要写入机会。缺必需参数、未知选项等在这里以退出码 2 报错；
+ * 明细数量非法等纯命令行业务拒绝以退出码 1 报错——两者都发生在等待之前，且不
+ * 创建数据目录或协调文件。库存余量、采购待收等状态校验仍在取得写入机会、读取
+ * 最新状态之后由 dispatch 完成。
+ */
+function preflightWriteArgs(cmd: string, tokens: string[]): void {
+  switch (cmd) {
+    case 'in':
+    case 'out':
+    case 'transfer':
+      parseDocArgs(cmd as DocType, tokens);
+      return;
+    case 'count':
+      parseCountArgs(tokens);
+      return;
+    case 'reverse':
+      parseReverseArgs(tokens);
+      return;
+    case 'arrival':
+      parseArrivalArgs(tokens);
+      return;
+    case 'cancel':
+      parseCancelArgs(tokens);
+      return;
+    case 'return':
+      parseReturnArgs(tokens);
+      return;
+    case 'po-transfer':
+      parseTransferArgs(tokens);
+      return;
+    case 'product': { // 仅 add 是写命令
+      const args = parseArgs(tokens.slice(1), []); // tokens[0] 为 add
+      const [idRaw, nameRaw, ...extra] = args.positionals;
+      if (idRaw === undefined || nameRaw === undefined || extra.length > 0)
+        throw new UsageError('用法：product add <商品编号> <商品名称>');
+      trimOrThrow('商品编号', idRaw);
+      trimOrThrow('商品名称', nameRaw);
+      return;
+    }
+    case 'po': { // 仅 register 是写命令
+      parsePurchaseArgs(tokens.slice(1)); // tokens[0] 为 register
+      return;
+    }
+    case 'rule': {
+      const sub = tokens[0];
+      const rest = tokens.slice(1);
+      if (sub === 'set') {
+        const args = parseArgs(rest, ['--wh', '--min', '--target']);
+        const [pidRaw, ...extra] = args.positionals;
+        if (pidRaw === undefined || extra.length > 0)
+          throw new UsageError('用法：rule set <商品编号> --wh <仓库> --min <下限> --target <目标>');
+        if (args.flags['--wh'] === undefined) throw new UsageError('补货规则必须提供 --wh <仓库>');
+        if (args.flags['--min'] === undefined) throw new UsageError('补货规则必须提供 --min <下限>');
+        if (args.flags['--target'] === undefined) throw new UsageError('补货规则必须提供 --target <目标>');
+        trimOrThrow('商品编号', pidRaw);
+        trimOrThrow('仓库标识', args.flags['--wh']);
+        parseNonNegInt('下限', args.flags['--min']);
+        parseNonNegInt('目标', args.flags['--target']);
+        return;
+      }
+      // delete / del
+      const args = parseArgs(rest, ['--wh']);
+      const [pidRaw, ...extra] = args.positionals;
+      if (pidRaw === undefined || extra.length > 0)
+        throw new UsageError('用法：rule delete <商品编号> --wh <仓库>');
+      if (args.flags['--wh'] === undefined) throw new UsageError('删除补货规则必须提供 --wh <仓库>');
+      trimOrThrow('商品编号', pidRaw);
+      trimOrThrow('仓库标识', args.flags['--wh']);
+      return;
+    }
+    case 'plan': {
+      const sub = tokens[0];
+      const rest = tokens.slice(1);
+      if (sub === 'save') {
+        parsePlanSaveArgs(rest);
+        return;
+      }
+      if (sub === 'execute' || sub === 'exec') {
+        const args = parseArgs(rest, []);
+        const [planRaw, ...extra] = args.positionals;
+        if (planRaw === undefined || extra.length > 0) throw new UsageError('用法：plan execute <方案编号>');
+        trimOrThrow('方案编号', planRaw);
+        return;
+      }
+      // withdraw
+      parsePlanWithdrawArgs(rest);
+      return;
+    }
+    case 'import': {
+      const args = parseArgs(tokens, ['--file']);
+      const file = args.flags['--file'];
+      if (file === undefined || args.positionals.length > 0)
+        throw new UsageError('用法：import --file <单据列表 JSON 文件>');
+      // 文件级结构错误（退出 2）与逐项格式错误（退出 1）都凭命令行/文件即可判定，
+      // 在等待前暴露；文件不可读属读写失败（退出 1），同样不等待、不建协调文件。
+      parseImportFile(readImportFile(file));
+      return;
+    }
+    default:
+      return; // 未知命令留给 dispatch 报“未知命令”
+  }
+}
+
+async function run(argv: string[]): Promise<void> {
   // 先抽出全局 -d/--data，其余按命令解析
   let dataDir = DEFAULT_DATA_DIR;
   const rest: string[] = [];
@@ -4995,13 +5385,26 @@ function run(argv: string[]): void {
   }
 
   const tokens = rest.slice(1);
-  // 写命令：先取得同一数据目录的写入机会，取得后才读取最新已提交状态，结束或
-  // 失败都释放占用；只读命令不创建协调文件，直接读取当前已提交状态。
-  const lock = isWriteCommand(cmd, tokens) ? acquireWriteLock(dataDir) : undefined;
+  const isWrite = isWriteCommand(cmd, tokens);
+  // 1) 纯命令行用法/格式错误：等待前报错（退出 2 或 1），不创建任何协调文件
+  if (isWrite) preflightWriteArgs(cmd, tokens);
+  // 2) 等待配置非法：等待前报标准错误退出 2，绝不退化为无限等待
+  const limit = isWrite ? lockWaitLimitMs() : LOCK_WAIT_DEFAULT_MS;
+  // 3) 取得同一数据目录的写入机会；取得后才读取最新已提交状态。结束或失败都
+  //    释放自己的占用；只读命令不创建协调文件，直接读取当前已提交状态。
+  const lock = isWrite ? await acquireWriteLock(dataDir, limit) : undefined;
   try {
+    // STOCKROOM_HOLD_MS 仅供本地回归：取得写入机会后先暂停指定毫秒（占用仍由
+    // worker 持有），用于复现“占用者存活但长时间暂停”，正常使用永不设置。
+    const holdRaw = process.env.STOCKROOM_HOLD_MS;
+    if (isWrite && holdRaw !== undefined) {
+      if (!/^\d+$/.test(holdRaw.trim()) || !Number.isSafeInteger(Number(holdRaw.trim())))
+        throw new LockConfigError(`环境变量 STOCKROOM_HOLD_MS 必须是非负安全整数毫秒，实际为：${holdRaw}`);
+      sleepSync(Number(holdRaw.trim()));
+    }
     dispatch(cmd, tokens, dataDir);
   } finally {
-    lock?.release();
+    await lock?.release();
   }
 }
 
@@ -5111,10 +5514,9 @@ function dispatch(cmd: string, tokens: string[], dataDir: string): void {
   }
 }
 
-try {
-  run(process.argv.slice(2));
-} catch (e) {
-  if (e instanceof UsageError) {
+/** 统一错误出口：用法/等待配置错误退出 2，业务与数据错误退出 1。 */
+function handleFatalError(e: unknown): never {
+  if (e instanceof UsageError || e instanceof LockConfigError) {
     console.error(`${APP_NAME}: ${e.message}`);
     process.exit(2);
   }
@@ -5125,3 +5527,5 @@ try {
   console.error(`${APP_NAME}: 发生未预期错误：${(e as Error)?.stack ?? String(e)}`);
   process.exit(1);
 }
+
+run(process.argv.slice(2)).catch(handleFatalError);

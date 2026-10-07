@@ -1,6 +1,9 @@
 #!/bin/sh
 # stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议、
-# 补货方案保存/执行/整案撤回、期间库存对账报表、采购待收转单、多进程写入协调。
+# 补货方案保存/执行/整案撤回、期间库存对账报表、采购待收转单、多进程写入协调与异常退出并发恢复。
+# 第 13 节覆盖并行竞争、超时、真实套接字占用者下的符号链接共用与原子替换前崩溃恢复；
+# 第 14 节覆盖多恢复者竞争、存活暂停（>2s）不被接管、释放归属、提交前/后异常退出重试、
+# 回收与释放交错下的余量/连续流水/去重，以及忙目录中的用法错误与等待配置边界（非法退出 2、0 立即、超时退出 1）。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -967,46 +970,70 @@ nok=$(grep -c '^0$' "$TMP/race-init.res")
 out=$(node "$APP" -d "$D24" product list)
 check "并发首次创建后两商品都在（P1）" "P1	螺丝" "$out"
 check "并发首次创建后两商品都在（P2）" "P2	螺母" "$out"
-# 等待上限：数据目录正忙时报标准错误退出 1，不留变动；仍存活写进程不被抢占
+# 等待上限：真实写进程持有协调套接字并暂停时，数据目录正忙报标准错误退出 1，
+# 不留变动；仍存活写进程不被抢占（占用者随后正常完成，其提交保留）
 D22="$TMP/data22"
-mkdir -p "$D22"
-sleep 30 & BUSY_PID=$!
-printf '%s other\n' "$BUSY_PID" > "$D22/.stockroom.json.lock"
-out=$(STOCKROOM_LOCK_WAIT_MS=600 node "$APP" -d "$D22" product add P1 螺丝 2>&1 >/dev/null); code=$?
-kill "$BUSY_PID" 2>/dev/null; wait "$BUSY_PID" 2>/dev/null
+node "$APP" -d "$D22" product add P1 螺丝 >/dev/null
+STOCKROOM_HOLD_MS=4000 node "$APP" -d "$D22" in HBUSY --wh W0 --item P1:1 >/dev/null 2>&1 & HOLDER=$!
+# 等占用者真正取得写入机会（它会先持锁再暂停）
+sleep 1
+ms() { node -e 'process.stdout.write(String(Date.now()))'; }
+t0=$(ms)
+out=$(STOCKROOM_LOCK_WAIT_MS=600 node "$APP" -d "$D22" in WAITER --wh W0 --item P1:1 2>&1 >/dev/null); code=$?
+t1=$(ms)
 if [ $code -ne 1 ]; then
   echo "FAIL - 等待超时退出码应为 1，实际 $code"; FAIL=1
 else
   check "等待超时明确说明数据目录正忙（不抢占仍存活写进程）" "数据目录正忙" "$out"
 fi
-[ ! -e "$D22/stockroom.json" ] && echo "ok   - 超时未留下本请求任何变动" || { echo "FAIL - 超时留下了数据文件"; FAIL=1; }
-rm -f "$D22/.stockroom.json.lock"
+[ $((t1 - t0)) -ge 500 ] && [ $((t1 - t0)) -le 1500 ] \
+  && echo "ok   - 超时按配置上限返回（约 $((t1 - t0))ms，未转成无限等待）" \
+  || { echo "FAIL - 超时耗时异常：$((t1 - t0))ms"; FAIL=1; }
+# 超时未留下“本请求”的变动：等待者单据 WAITER 不应入库（占用者提交 HBUSY=1 保留）
+out=$(node "$APP" -d "$D22" flow --product P1 --wh W0 2>&1)
+case "$out" in *WAITER*) echo "FAIL - 超时却把等待者单据写入了"; FAIL=1 ;; *) echo "ok   - 超时未留下本请求任何变动（等待者单据未入库）" ;; esac
+wait "$HOLDER" 2>/dev/null
+# 占用者存活期间未被抢占，暂停结束后其提交完整保留；等待者单据未生效
+out=$(node "$APP" -d "$D22" balance P1 --wh W0)
+check "占用者暂停期间未被接管，其提交保留（=1）" "余量：商品 P1 仓库 W0 = 1" "$out"
 # 符号链接路径与真实路径指向同一目录时共用协调；不同目录互不阻塞
 D25="$TMP/data25"
 mkdir -p "$D25"
 ln -s "$D25" "$TMP/data25-link"
-sleep 30 & BUSY2=$!
-printf '%s other\n' "$BUSY2" > "$D25/.stockroom.json.lock"
-out=$(STOCKROOM_LOCK_WAIT_MS=500 node "$APP" -d "$TMP/data25-link" product add P1 x 2>&1 >/dev/null); code=$?
-kill "$BUSY2" 2>/dev/null; wait "$BUSY2" 2>/dev/null
+node "$APP" -d "$D25" product add P1 螺丝 >/dev/null
+STOCKROOM_HOLD_MS=4000 node "$APP" -d "$D25" in HBUSY2 --wh W0 --item P1:1 >/dev/null 2>&1 & HOLDER2=$!
+sleep 1
+out=$(STOCKROOM_LOCK_WAIT_MS=500 node "$APP" -d "$TMP/data25-link" in WAITER2 --wh W0 --item P1:1 2>&1 >/dev/null); code=$?
 [ $code -eq 1 ] && echo "ok   - 符号链接路径与真实路径共用同一把锁" || { echo "FAIL - 符号链接路径未共用锁（退出码 $code）"; FAIL=1; }
 out=$(node "$APP" -d "$TMP/data26" product add P1 x 2>&1); code=$?
 [ $code -eq 0 ] && echo "ok   - 不同数据目录互不阻塞" || { echo "FAIL - 不同目录被阻塞：$out"; FAIL=1; }
-rm -f "$D25/.stockroom.json.lock"
-# 写进程异常退出（SIGKILL）后自动恢复：遗留锁与临时文件无需手工删除，
-# 遗留临时内容不被当作已提交数据
+wait "$HOLDER2" 2>/dev/null
+# 写进程异常退出（SIGKILL）后自动恢复：遗留的是已无监听的协调套接字与临时文件，
+# 无需手工删除，遗留临时内容不被当作已提交数据
 D23="$TMP/data23"
-mkdir -p "$D23"
-node -e 'require("node:fs").writeFileSync(process.argv[1], process.pid + " t\n"); process.kill(process.pid, "SIGKILL")' "$D23/.stockroom.json.lock" &
+node "$APP" -d "$D23" product add P1 螺丝 >/dev/null
+# 在“写完临时文件、原子替换之前”被杀：占用成为无监听套接字，临时内容未提交
+STOCKROOM_CRASH_AT=tmp-written node "$APP" -d "$D23" in CRASH0 --wh W1 --item P1:9 >/dev/null 2>&1 &
 CRASH_PID=$!
-wait $CRASH_PID 2>/dev/null
-printf '{not json' > "$D23/.stockroom.json.$CRASH_PID.tmp"
-out=$(node "$APP" -d "$D23" product add P1 螺丝 2>&1); code=$?
-[ $code -eq 0 ] && echo "ok   - 异常退出遗留锁自动恢复，无需手工删除" || { echo "FAIL - 遗留锁未自动恢复：$out"; FAIL=1; }
-[ ! -e "$D23/.stockroom.json.lock" ] && echo "ok   - 写入结束后释放锁" || { echo "FAIL - 写入结束后锁未释放"; FAIL=1; }
-[ ! -e "$D23/.stockroom.json.$CRASH_PID.tmp" ] && echo "ok   - 异常遗留临时文件被清理" || { echo "FAIL - 遗留临时文件未清理"; FAIL=1; }
-out=$(node "$APP" -d "$D23" product list)
-check "遗留临时内容未被当作已提交数据" "P1	螺丝" "$out"
+wait "$CRASH_PID" 2>/dev/null
+# 该命令自我 SIGKILL；确认确实遗留套接字后再恢复
+i=0; while [ $i -lt 50 ] && [ ! -S "$D23/.stockroom.json.lock" ]; do i=$((i+1)); sleep 0.05; done
+[ -S "$D23/.stockroom.json.lock" ] && echo "ok   - 崩溃后遗留无监听协调套接字" || echo "note: 崩溃后套接字路径已由系统回收（仍应可继续写入）"
+n_tmp=$(find "$D23" -maxdepth 1 -name '.stockroom.json.*.tmp' | wc -l | tr -d ' ')
+[ "$n_tmp" -ge 1 ] && echo "ok   - 崩溃遗留未替换的临时文件" || { echo "FAIL - 未发现遗留临时文件"; FAIL=1; }
+out=$(node "$APP" -d "$D23" in AFTER0 --wh W1 --item P1:3 2>&1); code=$?
+[ $code -eq 0 ] && echo "ok   - 异常退出遗留占用自动恢复，无需手工删除" || { echo "FAIL - 遗留占用未自动恢复：$out"; FAIL=1; }
+[ ! -S "$D23/.stockroom.json.lock" ] && echo "ok   - 取得写入机会并释放后无遗留协调套接字" || { echo "FAIL - 仍遗留套接字"; FAIL=1; }
+[ -z "$(find "$D23" -maxdepth 1 -name '.stockroom.json.*.tmp' -o -name '*.reclaim.*')" ] \
+  && echo "ok   - 异常遗留临时文件与回收副本均被清理" \
+  || { echo "FAIL - 仍遗留临时文件或回收副本："; ls -a "$D23"; FAIL=1; }
+# 崩溃发生在替换前，CRASH0 未生效；同号重试应作为新单首次成功，只计一次
+out=$(node "$APP" -d "$D23" in CRASH0 --wh W1 --item P1:9 2>&1)
+check "替换前崩溃的单据同号重试首次成功" "入库单 CRASH0 提交成功" "$out"
+out=$(node "$APP" -d "$D23" in CRASH0 --wh W1 --item P1:9 2>&1)
+check "再次提交为重复、返回原结果" "为重复提交" "$out"
+out=$(node "$APP" -d "$D23" balance P1 --wh W1)
+check "遗留临时内容未提交，最终余量=3+9=12" "余量：商品 P1 仓库 W1 = 12" "$out"
 # 整批导入作为整批参与协调：与单条写入不交错生效
 D27="$TMP/data27"
 node "$APP" -d "$D27" product add P1 螺丝 >/dev/null
@@ -1047,6 +1074,182 @@ node "$APP" -d "$D28" balance P1 >/dev/null
 node "$APP" -d "$D20" balance P1 >/dev/null
 [ ! -e "$D20/.stockroom.json.lock" ] && echo "ok   - 只读查询不创建锁文件" || { echo "FAIL - 只读查询创建了锁文件"; FAIL=1; }
 unset STOCKROOM_LOCK_WAIT_MS
+
+echo "== 14. 异常退出恢复：多恢复者竞争、存活暂停不被接管、释放归属与崩溃重试 =="
+# 辅助：统计已提交流水条数与末笔序号（entries 必须 1..N 连续）
+flowstat() { # flowstat <数据目录> -> "count lastSeq"
+  node -e '
+    const fs=require("node:fs");
+    let n=0,last=0,bad=0;
+    try{const s=JSON.parse(fs.readFileSync(process.argv[1]+"/stockroom.json","utf8"));
+      s.entries.forEach((e,i)=>{n++;last=e.seq;if(e.seq!==i+1)bad++});}catch{}
+    process.stdout.write(n+" "+last+" "+bad);
+  ' "$1"
+}
+
+# 14.1 多个恢复者同时发现同一遗留占用：只能串行取得写入机会，全部成功、不丢单、流水连续
+D40="$TMP/data40"
+node "$APP" -d "$D40" product add P1 螺丝 >/dev/null
+# 制造一个已退出进程的遗留占用（替换前崩溃，占用为无监听套接字，附带遗留临时文件）
+STOCKROOM_CRASH_AT=tmp-written STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D40" in SEEDCRASH --wh W1 --item P1:1 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+[ -S "$D40/.stockroom.json.lock" ] || echo "note: 遗留套接字已由系统回收，仍验证多写者串行"
+: > "$TMP/recover40.res"
+i=1
+while [ $i -le 6 ]; do
+  ( STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D40" in "RC$i" --wh W1 --item P1:1 >/dev/null 2>&1; echo $? ) >> "$TMP/recover40.res" &
+  i=$((i+1))
+done
+wait
+nok=$(grep -c '^0$' "$TMP/recover40.res")
+[ "$nok" -eq 6 ] && echo "ok   - 多个恢复者串行取得写入机会（6/6 成功，无丢失）" \
+  || { echo "FAIL - 多恢复者成功数应为 6，实际 $nok"; FAIL=1; }
+# SEEDCRASH 崩溃在替换前未生效；6 个恢复者各 +1
+out=$(node "$APP" -d "$D40" balance P1 --wh W1)
+check "多恢复者竞争后余量=6（遗留临时内容不计入）" "余量：商品 P1 仓库 W1 = 6" "$out"
+set -- $(flowstat "$D40")
+[ "$1" = 6 ] && [ "$2" = 6 ] && [ "$3" = 0 ] \
+  && echo "ok   - 多恢复者竞争后流水 1..6 连续（共 6 条）" \
+  || { echo "FAIL - 流水连续性异常：count=$1 last=$2 gap=$3"; FAIL=1; }
+[ -z "$(find "$D40" -maxdepth 1 \( -name '.s.*' -o -name '*.reclaim.*' -o -name '.stockroom.json.*.tmp' \))" ] \
+  && echo "ok   - 恢复竞争后无遗留回收副本或临时文件" \
+  || { echo "FAIL - 恢复竞争后仍有遗留物："; ls -a "$D40"; FAIL=1; }
+
+# 14.2 存活占用即使取得写入机会后暂停超过 2 秒也不被接管；其退出后自动恢复
+D41="$TMP/data41"
+node "$APP" -d "$D41" product add P1 螺丝 >/dev/null
+# 持有者取得写入机会后暂停 2500ms（超过旧实现 2 秒抢占宽限）再提交
+STOCKROOM_HOLD_MS=2500 node "$APP" -d "$D41" in HOLDER1 --wh W1 --item P1:5 >/dev/null 2>&1 & HP=$!
+sleep 0.8
+# 等待者只给 700ms：必须因“目录正忙”超时退出 1，绝不能接管存活持有者
+t0=$(ms); out=$(STOCKROOM_LOCK_WAIT_MS=700 node "$APP" -d "$D41" in NOSNATCH --wh W1 --item P1:99 2>&1 >/dev/null); rc=$?; t1=$(ms)
+[ $rc -eq 1 ] && echo "ok   - 持有者暂停超 2 秒期间不被接管（等待者超时退出 1）" \
+  || { echo "FAIL - 存活暂停被接管，退出码 $rc：$out"; FAIL=1; }
+[ $((t1 - t0)) -ge 600 ] && [ $((t1 - t0)) -le 1400 ] \
+  && echo "ok   - 等待者按上限返回（约 $((t1 - t0))ms）未转无限等待" \
+  || { echo "FAIL - 等待耗时异常 $((t1 - t0))ms"; FAIL=1; }
+wait "$HP" 2>/dev/null   # 持有者随后正常完成
+out=$(node "$APP" -d "$D41" balance P1 --wh W1)
+check "持有者暂停后提交完整保留（=5），抢占者单据未生效" "余量：商品 P1 仓库 W1 = 5" "$out"
+case $(node "$APP" -d "$D41" flow --product P1 --wh W1) in
+  *NOSNATCH*) echo "FAIL - 抢占者单据被写入"; FAIL=1 ;;
+  *) echo "ok   - 抢占者单据未入库" ;;
+esac
+# 持有者正常结束后，后续请求无需任何手工处理即可继续
+out=$(node "$APP" -d "$D41" in AFTERHOLD --wh W1 --item P1:2)
+check "持有者结束后后续请求自动恢复办理" "入库单 AFTERHOLD 提交成功" "$out"
+
+# 14.3 释放归属：一个持有者释放，等待者取得的是“新占用”，前者的释放不得删除后者占用
+D42="$TMP/data42"
+node "$APP" -d "$D42" product add P1 螺丝 >/dev/null
+# A 持锁暂停 1200ms；B、C 依次排队（给足等待上限）。A 释放只关闭自己的监听，
+# 不得删除 B 随后建立的新套接字；三份提交都必须保留。
+STOCKROOM_HOLD_MS=1200 STOCKROOM_LOCK_WAIT_MS=8000 node "$APP" -d "$D42" in OWN_A --wh W1 --item P1:1 >/dev/null 2>&1 & A=$!
+sleep 0.5
+STOCKROOM_LOCK_WAIT_MS=8000 node "$APP" -d "$D42" in OWN_B --wh W1 --item P1:1 >/dev/null 2>&1 & B=$!
+STOCKROOM_LOCK_WAIT_MS=8000 node "$APP" -d "$D42" in OWN_C --wh W1 --item P1:1 >/dev/null 2>&1 & C=$!
+wait "$A" "$B" "$C"
+out=$(node "$APP" -d "$D42" balance P1 --wh W1)
+check "释放归属正确：A/B/C 三份提交全部保留（=3）" "余量：商品 P1 仓库 W1 = 3" "$out"
+set -- $(flowstat "$D42")
+[ "$1" = 3 ] && [ "$3" = 0 ] && echo "ok   - 释放与取得交错后流水仍 1..3 连续" \
+  || { echo "FAIL - 释放归属交错导致流水异常：$1 $2 $3"; FAIL=1; }
+# 再写一笔确认协调点仍可用（没有被误删导致后续异常）
+out=$(node "$APP" -d "$D42" in OWN_D --wh W1 --item P1:1)
+check "释放交错后协调点仍可正常取得" "入库单 OWN_D 提交成功" "$out"
+
+# 14.4 原子替换之前崩溃：完全不生效、不留编号，同号重试首次成功
+D43="$TMP/data43"
+node "$APP" -d "$D43" product add P1 螺丝 >/dev/null
+STOCKROOM_CRASH_AT=before-tmp node "$APP" -d "$D43" in EARLY_CRASH --wh W1 --item P1:7 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+[ -z "$(find "$D43" -maxdepth 1 -name '.stockroom.json.*.tmp')" ] \
+  && echo "ok   - 写临时文件前崩溃未留下临时内容" || { echo "FAIL - before-tmp 崩溃留下临时文件"; FAIL=1; }
+out=$(node "$APP" -d "$D43" in EARLY_CRASH --wh W1 --item P1:7 2>&1)
+check "替换前崩溃的单据同号重试首次成功" "入库单 EARLY_CRASH 提交成功" "$out"
+out=$(node "$APP" -d "$D43" balance P1 --wh W1)
+check "替换前崩溃未生效，重试后余量=7" "余量：商品 P1 仓库 W1 = 7" "$out"
+
+# 14.5 原子替换之后（输出成功之前）崩溃：完整提交保留，重试按去重返回原结果
+D44="$TMP/data44"
+node "$APP" -d "$D44" product add P1 螺丝 >/dev/null
+STOCKROOM_CRASH_AT=renamed node "$APP" -d "$D44" in LATE_CRASH --wh W1 --item P1:4 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+out=$(node "$APP" -d "$D44" balance P1 --wh W1)
+check "替换后即使未输出成功，完整提交已保留（=4）" "余量：商品 P1 仓库 W1 = 4" "$out"
+out=$(node "$APP" -d "$D44" in LATE_CRASH --wh W1 --item P1:4 2>&1)
+check "替换后崩溃的单据重试返回原结果（重复提交）" "为重复提交" "$out"
+out=$(node "$APP" -d "$D44" balance P1 --wh W1)
+check "重试不重复生效（仍=4）" "余量：商品 P1 仓库 W1 = 4" "$out"
+set -- $(flowstat "$D44")
+[ "$1" = 1 ] && [ "$2" = 1 ] && echo "ok   - 替换后崩溃+重试只产生一条流水" \
+  || { echo "FAIL - 流水条数异常：$1 $2"; FAIL=1; }
+
+# 14.6 回收与释放交错下的业务正确性：竞争有限库存不超量、同号同内容只生效一次、
+#      同号不同内容仅一个成功，且失败后已提交状态不受影响
+D45="$TMP/data45"
+node "$APP" -d "$D45" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D45" in BASE45 --wh W2 --item P1:3 >/dev/null
+# 先制造一次遗留占用，紧接 6 个抢 3 件库存的出库并发（首个恢复者先清遗留再参与）
+STOCKROOM_CRASH_AT=tmp-written STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D45" in C45 --wh W9 --item P1:1 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+: > "$TMP/race45.res"
+i=1
+while [ $i -le 6 ]; do
+  ( rc=0; STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D45" out "LIMIT$i" --wh W2 --item P1:1 >/dev/null 2>&1 || rc=$?
+    echo "LIMIT$i $rc" ) >> "$TMP/race45.res" &
+  i=$((i+1))
+done
+wait
+nok=$(awk '$2==0{n++}END{print n+0}' "$TMP/race45.res")
+nfail=$(awk '$2==1{n++}END{print n+0}' "$TMP/race45.res")
+[ "$nok" -eq 3 ] && [ "$nfail" -eq 3 ] \
+  && echo "ok   - 恢复与竞争交错下抢 3 件库存：3 成 3 拒，不超量" \
+  || { echo "FAIL - 恢复后竞争出库结果异常：成 $nok 拒 $nfail（应 3/3）"; cat "$TMP/race45.res"; FAIL=1; }
+out=$(node "$APP" -d "$D45" balance P1 --wh W2)
+check "恢复交错后竞争出库余量精确为 0" "余量：商品 P1 仓库 W2 = 0" "$out"
+# 失败不占编号：取一个实际被拒的单据，库存补足后同号首次成功
+REJDOC=$(awk '$2==1{print $1;exit}' "$TMP/race45.res")
+node "$APP" -d "$D45" in REFILL45 --wh W2 --item P1:2 >/dev/null
+out=$(node "$APP" -d "$D45" out "$REJDOC" --wh W2 --item P1:1)
+check "业务被拒不保留本请求状态，补库存后同号可成功" "出库单 ${REJDOC} 提交成功" "$out"
+# 同号同内容并发只生效一次（遗留占用存在时启动，恢复者与后继者重放同一单）
+STOCKROOM_CRASH_AT=tmp-written STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D45" in DUP45X --wh W3 --item P1:1 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+: > "$TMP/dup45.res"
+( STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D45" in DUP45 --wh W3 --item P1:8 >/dev/null 2>&1; echo $? ) >> "$TMP/dup45.res" &
+( STOCKROOM_LOCK_WAIT_MS=20000 node "$APP" -d "$D45" in DUP45 --wh W3 --item P1:8 >/dev/null 2>&1; echo $? ) >> "$TMP/dup45.res" &
+wait
+[ "$(grep -c '^0$' "$TMP/dup45.res")" -eq 2 ] && echo "ok   - 恢复交错下同号同内容双方都成功（首生效+重放）" \
+  || { echo "FAIL - 同号同内容并发退出码异常"; FAIL=1; }
+out=$(node "$APP" -d "$D45" balance P1 --wh W3)
+check "恢复交错下同号同内容只生效一次（=8）" "余量：商品 P1 仓库 W3 = 8" "$out"
+
+# 14.7 忙目录中的用法错误与等待配置边界：均在等待前退出 2，且不创建协调文件
+D46="$TMP/data46"
+node "$APP" -d "$D46" product add P1 螺丝 >/dev/null
+STOCKROOM_HOLD_MS=3000 node "$APP" -d "$D46" in HBUSY46 --wh W0 --item P1:1 >/dev/null 2>&1 & HP=$!
+sleep 0.7
+for badargs in "in U1 --wh W1" "product add ONLYONE" "po-transfer T1 --orig PO1" "plan withdraw" ; do
+  t0=$(ms); node "$APP" -d "$D46" $badargs >/dev/null 2>ue46; rc=$?; t1=$(ms)
+  [ $rc -eq 2 ] && [ $((t1 - t0)) -lt 1000 ] \
+    && echo "ok   - 忙目录用法错误先于等待退出 2（${badargs}）" \
+    || { echo "FAIL - 忙目录用法错误：[${badargs}] 退出 $rc 耗时 $((t1-t0))ms：$(cat ue46)"; FAIL=1; }
+done
+for badwait in "abc" "-5" "1.2" "99999999999999999999" "1e3" ; do
+  STOCKROOM_LOCK_WAIT_MS="$badwait" node "$APP" -d "$D46" in UW --wh W1 --item P1:1 >/dev/null 2>we46; rc=$?
+  [ $rc -eq 2 ] && echo "ok   - 非法等待配置 [${badwait}] 等待前退出 2" \
+  || { echo "FAIL - 等待配置 [${badwait}] 退出码 $rc：$(cat we46)"; FAIL=1; }
+done
+# 0 = 仅立即尝试一次：忙目录立即退出 1，合法目录/已释放目录立即成功
+t0=$(ms); STOCKROOM_LOCK_WAIT_MS=0 node "$APP" -d "$D46" in UZ --wh W1 --item P1:1 >/dev/null 2>ze46; rc=$?; t1=$(ms)
+[ $rc -eq 1 ] && [ $((t1 - t0)) -lt 1000 ] && echo "ok   - STOCKROOM_LOCK_WAIT_MS=0 忙目录立即退出 1" \
+  || { echo "FAIL - wait=0 忙目录：退出 $rc 耗时 $((t1-t0))ms"; FAIL=1; }
+grep -q "数据目录正忙" ze46 && echo "ok   - wait=0 超时报数据目录正忙" || { echo "FAIL - 超时文案错误：$(cat ze46)"; FAIL=1; }
+wait "$HP" 2>/dev/null
+out=$(STOCKROOM_LOCK_WAIT_MS=0 node "$APP" -d "$D46" in AFTER46 --wh W1 --item P1:2 2>&1); rc=$?
+[ $rc -eq 0 ] && echo "ok   - wait=0 空闲目录立即取得写入机会" || { echo "FAIL - 空闲目录 wait=0：$out"; FAIL=1; }
+rm -f ue46 we46 ze46
 
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
