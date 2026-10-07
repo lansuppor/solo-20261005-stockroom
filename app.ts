@@ -131,6 +131,15 @@ interface PlanRecord {
   snapshot: PlanSnapshot; // 保存时冻结的核对快照
   status: 'pending' | 'executed';
   execResultLines?: string[]; // 已执行方案的落单结果原文，供重放（不再核对、不再生效）
+  withdrawnBy?: string; // 整案撤回本方案的撤回请求编号（每案最多成功撤回一次；未撤回无此字段）
+}
+
+interface PlanWithdrawalRecord {
+  reqId: string; // 撤回请求编号（与库存/到货/取消/退货/转单/冲销单共用编号空间）
+  planId: string; // 被整案撤回的方案编号
+  transferRevs: Record<string, string>; // 调拨子单编号 -> 为其指定的冲销单号（逐一对应）
+  purchaseCancels: Record<string, string>; // 采购子单编号 -> 为其指定的取消单号（逐一对应）
+  resultLines: string[]; // 撤回提交结果，供幂等重放
 }
 
 interface Store {
@@ -147,6 +156,7 @@ interface Store {
   poTransfers: Record<string, PoTransferRecord>; // 采购待收转单去重与结果（与库存单共用编号空间，不改库存与流水）
   rules: Record<string, Record<string, ReplenishRule>>; // 补货规则：商品 -> 仓库 -> 下限/目标（每组合唯一）
   plans: Record<string, PlanRecord>; // 补货方案（独立编号空间；保存不改库存/采购/流水）
+  planWithdrawals: Record<string, PlanWithdrawalRecord>; // 方案整案撤回请求（请求编号与库存单据共用编号空间）
 }
 
 const REV_ENTRY_TYPES = new Set<EntryType>([
@@ -172,6 +182,7 @@ function emptyStore(): Store {
     poTransfers: nullProto(),
     rules: nullProto(),
     plans: nullProto(),
+    planWithdrawals: nullProto(),
   };
 }
 
@@ -593,6 +604,12 @@ function validateStore(data: unknown): Store {
           throw bad(`冲销单 ${rec.orig} 不可被再次冲销（冲销单不能冲销冲销单）`);
         if (store.purchases[rec.orig] !== undefined)
           throw bad(`冲销单 ${revId} 指向的 ${rec.orig} 是采购单，采购单不可冲销`);
+        // 用 data.planWithdrawals 判定，避免依赖键的先后顺序（此时 store.planWithdrawals 可能尚未装全）
+        if (
+          isPlainObject(data.planWithdrawals) &&
+          isPlainObject((data.planWithdrawals as Record<string, unknown>)[rec.orig])
+        )
+          throw bad(`冲销单 ${revId} 指向的 ${rec.orig} 是方案撤回请求，撤回请求本身不可冲销`);
         throw bad(`冲销单 ${revId} 指向的原单 ${rec.orig} 不存在`);
       }
       store.reversals[revId] = { orig: rec.orig, resultLines: rec.resultLines };
@@ -971,13 +988,107 @@ function validateStore(data: unknown): Store {
         throw bad(`待执行方案 ${planId} 不应携带落单结果`);
       }
 
+      // 撤回标记：仅已执行方案可携带；对应的撤回请求记录在后面统一校验（关联缺失或不符拒读）
+      let withdrawnBy: string | undefined;
+      if (rec.withdrawnBy !== undefined) {
+        if (typeof rec.withdrawnBy !== 'string' || rec.withdrawnBy.trim() === '')
+          throw bad(`方案 ${planId} 的撤回请求编号非法`);
+        if (rec.status !== 'executed') throw bad(`待执行方案 ${planId} 不应携带撤回标记`);
+        withdrawnBy = rec.withdrawnBy;
+      }
+
       store.plans[planId] = {
         planId, transfers, purchases,
         snapshot: { rules: snapRules, stock: snapStock, pending: snapPending },
         status: rec.status,
         ...(execResultLines !== undefined ? { execResultLines } : {}),
+        ...(withdrawnBy !== undefined ? { withdrawnBy } : {}),
       };
     }
+  }
+
+  // planWithdrawals 为新增字段：合法旧数据没有该字段，按无撤回处理并保留原结果。
+  // 撤回请求编号与库存/到货/取消/退货/转单/冲销单共用全局唯一编号空间；
+  // 撤回关联（方案撤回标记、调拨冲销单、采购取消单）缺失或内容不符一律视为损坏数据，拒读拒写。
+  if (data.planWithdrawals !== undefined) {
+    if (!isPlainObject(data.planWithdrawals)) throw bad('planWithdrawals 不是对象');
+    for (const [reqId, rec] of Object.entries(data.planWithdrawals)) {
+      if (typeof reqId !== 'string' || reqId.trim() === '') throw bad('存在非法撤回请求编号');
+      if (store.docs[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与原始库存单据编号冲突`);
+      if (store.arrivals[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与到货单编号冲突`);
+      if (store.cancels[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与取消单编号冲突`);
+      if (store.returns[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与退货单编号冲突`);
+      if (store.poTransfers[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与采购转单编号冲突`);
+      if (store.reversals[reqId] !== undefined) throw bad(`撤回请求编号 ${reqId} 与冲销单编号冲突`);
+      if (
+        !isPlainObject(rec) ||
+        typeof rec.planId !== 'string' || rec.planId.trim() === '' ||
+        !isPlainObject(rec.transferRevs) ||
+        !isPlainObject(rec.purchaseCancels) ||
+        !Array.isArray(rec.resultLines) || !rec.resultLines.every((l) => typeof l === 'string')
+      )
+        throw bad(`撤回请求 ${reqId} 的记录非法`);
+      if (rec.reqId !== undefined && rec.reqId !== reqId) throw bad(`撤回请求 ${reqId} 的内嵌编号不一致`);
+      const plan = store.plans[rec.planId];
+      if (plan === undefined) throw bad(`撤回请求 ${reqId} 指向的方案 ${rec.planId} 不存在（关联断裂）`);
+      if (plan.status !== 'executed') throw bad(`撤回请求 ${reqId} 指向的方案 ${rec.planId} 未执行`);
+      if (plan.withdrawnBy !== reqId)
+        throw bad(`撤回请求 ${reqId} 与方案 ${rec.planId} 的撤回标记不一致（关联断裂）`);
+
+      // 新编号（请求、冲销单、取消单）彼此不得重号
+      const newIds = new Set<string>([reqId]);
+      // 调拨映射：与方案调拨子单逐一对应，每张子单对应一张冲销其的冲销单
+      const transferRevs = nullProto<Record<string, string>>();
+      const planDocIds = new Set(plan.transfers.map((t) => t.docId));
+      for (const [docId, revId] of Object.entries(rec.transferRevs)) {
+        if (docId.trim() === '' || typeof revId !== 'string' || revId.trim() === '')
+          throw bad(`撤回请求 ${reqId} 的调拨撤回映射非法`);
+        if (!planDocIds.has(docId))
+          throw bad(`撤回请求 ${reqId} 的调拨映射 ${docId} 不是方案 ${rec.planId} 的调拨子单（关联断裂）`);
+        planDocIds.delete(docId);
+        const rev = store.reversals[revId];
+        if (rev === undefined) throw bad(`撤回请求 ${reqId} 的冲销单 ${revId} 不存在（关联断裂）`);
+        if (rev.orig !== docId)
+          throw bad(`撤回请求 ${reqId} 的冲销单 ${revId} 未冲销调拨子单 ${docId}（关联断裂）`);
+        if (newIds.has(revId)) throw bad(`撤回请求 ${reqId} 的新子单编号 ${revId} 重号`);
+        newIds.add(revId);
+        transferRevs[docId] = revId;
+      }
+      if (planDocIds.size > 0)
+        throw bad(`撤回请求 ${reqId} 缺少调拨子单 ${[...planDocIds][0]} 的冲销映射（关联断裂）`);
+      // 采购映射：与方案采购子单逐一对应，每张取消单取消该子单的全部订购量
+      const purchaseCancels = nullProto<Record<string, string>>();
+      const planPoIds = new Set(plan.purchases.map((p) => p.poId));
+      for (const [poId, canId] of Object.entries(rec.purchaseCancels)) {
+        if (poId.trim() === '' || typeof canId !== 'string' || canId.trim() === '')
+          throw bad(`撤回请求 ${reqId} 的采购撤回映射非法`);
+        if (!planPoIds.has(poId))
+          throw bad(`撤回请求 ${reqId} 的采购映射 ${poId} 不是方案 ${rec.planId} 的采购子单（关联断裂）`);
+        planPoIds.delete(poId);
+        const can = store.cancels[canId];
+        if (can === undefined) throw bad(`撤回请求 ${reqId} 的取消单 ${canId} 不存在（关联断裂）`);
+        if (can.poId !== poId)
+          throw bad(`撤回请求 ${reqId} 的取消单 ${canId} 不属于采购子单 ${poId}（关联断裂）`);
+        const po = store.purchases[poId];
+        if (po === undefined || stableStringify(can.qty) !== stableStringify(po.ordered))
+          throw bad(`撤回请求 ${reqId} 的取消单 ${canId} 未取消采购子单 ${poId} 的全部订购量（关联断裂）`);
+        if (newIds.has(canId)) throw bad(`撤回请求 ${reqId} 的新子单编号 ${canId} 重号`);
+        newIds.add(canId);
+        purchaseCancels[poId] = canId;
+      }
+      if (planPoIds.size > 0)
+        throw bad(`撤回请求 ${reqId} 缺少采购子单 ${[...planPoIds][0]} 的取消映射（关联断裂）`);
+
+      store.planWithdrawals[reqId] = {
+        reqId, planId: rec.planId, transferRevs, purchaseCancels, resultLines: rec.resultLines,
+      };
+    }
+  }
+  // 方案的撤回标记必须能找到对应撤回请求（双向关联完整）
+  for (const [planId, plan] of Object.entries(store.plans)) {
+    if (plan.withdrawnBy === undefined) continue;
+    if (store.planWithdrawals[plan.withdrawnBy] === undefined)
+      throw bad(`方案 ${planId} 的撤回请求 ${plan.withdrawnBy} 不存在（关联断裂）`);
   }
 
   return store;
@@ -1528,6 +1639,7 @@ class Ledger {
   private readonly cancels: Record<string, CancelRecord> = nullProto();
   private readonly returns: Record<string, ReturnRecord> = nullProto();
   private readonly transfers: Record<string, PoTransferRecord> = nullProto();
+  private readonly withdrawals: Record<string, PlanWithdrawalRecord> = nullProto();
   private readonly reversedOrigs = new Set<string>();
   private readonly newDocIds: string[] = [];
   private readonly newRevIds: string[] = [];
@@ -1551,6 +1663,7 @@ class Ledger {
     for (const [id, rec] of Object.entries(store.cancels)) this.cancels[id] = rec;
     for (const [id, rec] of Object.entries(store.returns)) this.returns[id] = rec;
     for (const [id, rec] of Object.entries(store.poTransfers)) this.transfers[id] = rec;
+    for (const [id, rec] of Object.entries(store.planWithdrawals)) this.withdrawals[id] = rec;
   }
 
   /** 是否有新生效单据：无新单据（全部重复）时 commit 不改写数据。 */
@@ -1735,6 +1848,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.arrId} 已用于退货单，拒绝提交`);
     if (this.transfers[req.arrId] !== undefined)
       throw new BizError(`单据编号 ${req.arrId} 已用于采购转单，拒绝提交`);
+    if (this.withdrawals[req.arrId] !== undefined)
+      throw new BizError(`单据编号 ${req.arrId} 已用于方案撤回请求，拒绝提交`);
 
     const po = this.pos[req.poId];
     if (po === undefined) throw new BizError(`采购单 ${req.poId} 不存在，拒绝到货`);
@@ -1837,6 +1952,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.canId} 已用于退货单，拒绝提交`);
     if (this.transfers[req.canId] !== undefined)
       throw new BizError(`单据编号 ${req.canId} 已用于采购转单，拒绝提交`);
+    if (this.withdrawals[req.canId] !== undefined)
+      throw new BizError(`单据编号 ${req.canId} 已用于方案撤回请求，拒绝提交`);
 
     const po = this.pos[req.poId];
     if (po === undefined) throw new BizError(`采购单 ${req.poId} 不存在，拒绝取消`);
@@ -1925,6 +2042,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.retId} 已用于冲销单，拒绝提交`);
     if (this.transfers[req.retId] !== undefined)
       throw new BizError(`单据编号 ${req.retId} 已用于采购转单，拒绝提交`);
+    if (this.withdrawals[req.retId] !== undefined)
+      throw new BizError(`单据编号 ${req.retId} 已用于方案撤回请求，拒绝提交`);
 
     const arr = this.arrivals[req.arrId];
     if (arr === undefined) throw new BizError(`原到货单 ${req.arrId} 不存在，拒绝退货`);
@@ -2035,6 +2154,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.tId} 已用于退货单，拒绝提交`);
     if (this.revs[req.tId] !== undefined)
       throw new BizError(`单据编号 ${req.tId} 已用于冲销单，拒绝提交`);
+    if (this.withdrawals[req.tId] !== undefined)
+      throw new BizError(`单据编号 ${req.tId} 已用于方案撤回请求，拒绝提交`);
 
     const origPo = this.pos[req.origPoId];
     if (origPo === undefined) throw new BizError(`原采购单 ${req.origPoId} 不存在，拒绝转单`);
@@ -2195,6 +2316,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.docId} 已用于退货单，拒绝提交`);
     if (this.transfers[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于采购转单，拒绝提交`);
+    if (this.withdrawals[req.docId] !== undefined)
+      throw new BizError(`单据编号 ${req.docId} 已用于方案撤回请求，拒绝提交`);
 
     for (const pid of req.items.keys()) {
       if (this.base.products[pid] === undefined) throw new BizError(`商品未登记，拒绝整单：${pid}`);
@@ -2282,6 +2405,8 @@ class Ledger {
       throw new BizError(`单据编号 ${req.docId} 已用于退货单，拒绝提交`);
     if (this.transfers[req.docId] !== undefined)
       throw new BizError(`单据编号 ${req.docId} 已用于采购转单，拒绝提交`);
+    if (this.withdrawals[req.docId] !== undefined)
+      throw new BizError(`单据编号 ${req.docId} 已用于方案撤回请求，拒绝提交`);
 
     const pids = [...req.items.keys()].sort();
     for (const pid of pids) {
@@ -2348,6 +2473,8 @@ class Ledger {
       throw new BizError(`编号 ${revId} 已是退货单编号，不能用作冲销单，拒绝提交`);
     if (this.transfers[revId] !== undefined)
       throw new BizError(`编号 ${revId} 已是采购转单编号，不能用作冲销单，拒绝提交`);
+    if (this.withdrawals[revId] !== undefined)
+      throw new BizError(`编号 ${revId} 已是方案撤回请求编号，不能用作冲销单，拒绝提交`);
 
     // 到货原单：整单冲销到货——从当前收货仓扣回原数量并减少有效到货量，
     // 收齐采购重新待收；不撤销后续业务。到货冲销与库存单冲销分开处理。
@@ -2376,6 +2503,8 @@ class Ledger {
         throw new BizError(`原单 ${origId} 是冲销单，冲销单不可冲销，拒绝提交`);
       if (this.pos[origId] !== undefined)
         throw new BizError(`原单 ${origId} 是采购单，采购单不可冲销，拒绝提交`);
+      if (this.withdrawals[origId] !== undefined)
+        throw new BizError(`原单 ${origId} 是补货方案撤回请求，撤回请求本身不可冲销，拒绝提交`);
       throw new BizError(`原单 ${origId} 不存在或尚未在本列表中出现，拒绝冲销`);
     }
 
@@ -2969,6 +3098,8 @@ function runRecon(rest: string[], store: Store): void {
       throw new BizError(`${label}单据 ${id} 只有取消记录，没有库存流水，不能用作期间边界`);
     if (store.poTransfers[id] !== undefined)
       throw new BizError(`${label}单据 ${id} 只有采购转单记录，没有库存流水，不能用作期间边界`);
+    if (store.planWithdrawals[id] !== undefined)
+      throw new BizError(`${label}单据 ${id} 只有方案撤回请求记录，没有库存流水，不能用作期间边界`);
     if (store.reversals[id] !== undefined) {
       const orig = store.reversals[id].orig;
       if (store.poTransfers[orig] !== undefined)
@@ -3672,16 +3803,32 @@ function parsePlanSaveArgs(tokens: string[]): PlanSaveSpec {
   return { planId, transfers, purchases };
 }
 
-/** 打印方案明细（调拨来源/目标仓/商品/数量、采购供应商与子单编号、状态）。 */
-function printPlan(plan: PlanRecord): void {
+/** 方案状态文本：待执行 / 已执行 / 已执行（已撤回）。 */
+function planStatusText(plan: PlanRecord): string {
+  if (plan.status !== 'executed') return '待执行';
+  return plan.withdrawnBy !== undefined ? '已执行（已撤回）' : '已执行';
+}
+
+/** 打印方案明细（调拨来源/目标仓/商品/数量、采购供应商与子单编号、状态与撤回关联）。 */
+function printPlan(plan: PlanRecord, store?: Store): void {
   console.log(
-    `补货方案 ${plan.planId}：状态 ${plan.status === 'executed' ? '已执行' : '待执行'}，` +
+    `补货方案 ${plan.planId}：状态 ${planStatusText(plan)}，` +
       `调拨 ${plan.transfers.length} 份、采购 ${plan.purchases.length} 份`,
   );
   for (const t of plan.transfers)
     console.log(`  调拨子单 ${t.docId}：商品 ${t.product}，${t.from} -> ${t.to}，数量 ${t.qty}`);
   for (const p of plan.purchases)
     console.log(`  采购子单 ${p.poId}：商品 ${p.product}，收货仓 ${p.wh}，数量 ${p.qty}，供应商 ${p.supplier}`);
+  if (plan.withdrawnBy !== undefined && store !== undefined) {
+    const w = store.planWithdrawals[plan.withdrawnBy];
+    if (w !== undefined) {
+      console.log(`  已整案撤回：撤回请求 ${w.reqId}（原子单与新子单关联如下，方案不能再次撤回）`);
+      for (const t of plan.transfers)
+        console.log(`    调拨子单 ${t.docId} -> 冲销单 ${w.transferRevs[t.docId]}`);
+      for (const p of plan.purchases)
+        console.log(`    采购子单 ${p.poId} -> 取消单 ${w.purchaseCancels[p.poId]}`);
+    }
+  }
 }
 
 /**
@@ -3863,7 +4010,7 @@ function runPlanExecute(tokens: string[], dataDir: string, store: Store): void {
     if (
       store.docs[t.docId] !== undefined || store.arrivals[t.docId] !== undefined ||
       store.cancels[t.docId] !== undefined || store.returns[t.docId] !== undefined ||
-      store.poTransfers[t.docId] !== undefined ||
+      store.poTransfers[t.docId] !== undefined || store.planWithdrawals[t.docId] !== undefined ||
       store.reversals[t.docId] !== undefined
     )
       throw new BizError(`调拨子单编号 ${t.docId} 已被占用，整案拒绝执行（不接管已有单据）`);
@@ -3900,11 +4047,231 @@ function runPlanExecute(tokens: string[], dataDir: string, store: Store): void {
   for (const line of lines) console.log(line);
 }
 
+// ---------- 补货方案整案撤回 ----------
+
+interface PlanWithdrawSpec {
+  reqId: string; // 撤回请求编号（与库存单据共用编号空间）
+  planId: string; // 方案编号（独立方案编号空间）
+  transferRevs: Map<string, string>; // 调拨子单编号 -> 冲销单号
+  purchaseCancels: Map<string, string>; // 采购子单编号 -> 取消单号
+}
+
+/**
+ * 解析 plan withdraw 参数。标识去首尾空白后非空、区分大小写；
+ * 子单映射格式为 “子单编号:新单号”（首个冒号分隔，新单号可含冒号）。
+ * 缺参数、映射段格式不对、同一子单重复指定属于用法错误（退出 2）。
+ */
+function parsePlanWithdrawArgs(tokens: string[]): PlanWithdrawSpec {
+  const args = parseArgs(tokens, ['--plan'], ['--transfer', '--purchase']);
+  const [reqRaw, ...extra] = args.positionals;
+  if (reqRaw === undefined || extra.length > 0)
+    throw new UsageError(
+      '用法：plan withdraw <请求编号> --plan <方案编号> ' +
+        '--transfer <调拨子单编号>:<冲销单号> [...] --purchase <采购子单编号>:<取消单号> [...]',
+    );
+  if (args.flags['--plan'] === undefined) throw new UsageError('撤回必须提供 --plan <方案编号>');
+
+  const transferRevs = new Map<string, string>();
+  for (const raw of args.multi['--transfer'] ?? []) {
+    const idx = raw.indexOf(':');
+    if (idx < 0) throw new UsageError(`调拨撤回映射格式应为 “调拨子单编号:冲销单号”：${raw}`);
+    const docId = trimOrThrow('调拨子单编号', raw.slice(0, idx));
+    const revId = trimOrThrow('冲销单号', raw.slice(idx + 1));
+    if (transferRevs.has(docId)) throw new UsageError(`调拨子单 ${docId} 的撤回映射重复指定`);
+    transferRevs.set(docId, revId);
+  }
+  const purchaseCancels = new Map<string, string>();
+  for (const raw of args.multi['--purchase'] ?? []) {
+    const idx = raw.indexOf(':');
+    if (idx < 0) throw new UsageError(`采购撤回映射格式应为 “采购子单编号:取消单号”：${raw}`);
+    const poId = trimOrThrow('采购子单编号', raw.slice(0, idx));
+    const canId = trimOrThrow('取消单号', raw.slice(idx + 1));
+    if (purchaseCancels.has(poId)) throw new UsageError(`采购子单 ${poId} 的撤回映射重复指定`);
+    purchaseCancels.set(poId, canId);
+  }
+
+  return {
+    reqId: trimOrThrow('撤回请求编号', reqRaw),
+    planId: trimOrThrow('方案编号', args.flags['--plan']),
+    transferRevs,
+    purchaseCancels,
+  };
+}
+
+/** 撤回映射的规范化串：顺序无关，用于同号重放比较。 */
+function canonicalWithdrawMapping(spec: PlanWithdrawSpec): string {
+  return stableStringify({
+    t: [...spec.transferRevs.entries()].sort(),
+    p: [...spec.purchaseCancels.entries()].sort(),
+  });
+}
+
+function canonicalWithdrawMappingOf(rec: PlanWithdrawalRecord): string {
+  return stableStringify({
+    t: Object.entries(rec.transferRevs).sort(),
+    p: Object.entries(rec.purchaseCancels).sort(),
+  });
+}
+
+function withdrawHeader(rec: PlanWithdrawalRecord): string {
+  return (
+    `撤回请求 ${rec.reqId} 提交成功，整案撤回补货方案 ${rec.planId}：` +
+    `冲销调拨 ${Object.keys(rec.transferRevs).length} 份、取消采购 ${Object.keys(rec.purchaseCancels).length} 份` +
+    `（不恢复库存快照、不删除原单与后续业务）：`
+  );
+}
+
+/**
+ * 整案撤回已执行的补货方案：取消尚未履行的补货安排。
+ * 仅允许已执行且未撤回的方案；各调拨子单须未冲销，各采购子单所有商品须全量待收
+ * （按现有精确净进度判断：有效到货与有效取消均为零；历史业务经合法操作恢复此状态
+ * 也允许；不核对保存快照，规则变化不阻止撤回）。成功在当前余量上冲销全部调拨
+ * （追加普通冲销流水），并取消全部采购的完整订购量、待收归零（不改库存与流水）；
+ * 不恢复库存快照，不删除原单或后续业务。缺货、库存溢出、进度不符或编号冲突均整案
+ * 拒绝，本次库存、进度、流水、编号、冲销关系及撤回标记全部不保留，可同号重试。
+ * 每案最多成功撤回一次；同请求编号、同方案及子单映射重放返回原结果，不再校验、
+ * 生效或改写文件；撤回请求本身不可冲销。
+ */
+function runPlanWithdraw(tokens: string[], dataDir: string, store: Store): void {
+  const spec = parsePlanWithdrawArgs(tokens);
+
+  // 幂等重放：同请求编号、同方案及子单映射返回原结果，不再校验、生效或改写文件
+  const existed = store.planWithdrawals[spec.reqId];
+  if (existed !== undefined) {
+    if (existed.planId !== spec.planId || canonicalWithdrawMappingOf(existed) !== canonicalWithdrawMapping(spec))
+      throw new BizError(`撤回请求编号 ${spec.reqId} 已用于内容不同的撤回请求，拒绝提交`);
+    console.log(
+      `撤回请求 ${spec.reqId} 为重复提交，方案与子单映射与原提交一致，返回原撤回结果（不再校验、不再生效、不改写文件）：`,
+    );
+    console.log(withdrawHeader(existed));
+    for (const line of existed.resultLines) console.log(line);
+    return;
+  }
+
+  // 请求编号与库存/到货/取消/退货/转单/冲销单共用全局唯一编号空间：即使内容相同也不接管
+  if (store.docs[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于入库/出库/调拨/盘点单，拒绝提交`);
+  if (store.arrivals[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于到货单，拒绝提交`);
+  if (store.cancels[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于取消单，拒绝提交`);
+  if (store.returns[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于退货单，拒绝提交`);
+  if (store.poTransfers[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于采购转单，拒绝提交`);
+  if (store.reversals[spec.reqId] !== undefined)
+    throw new BizError(`撤回请求编号 ${spec.reqId} 已用于冲销单，拒绝提交`);
+
+  const plan = store.plans[spec.planId];
+  if (plan === undefined) throw new BizError(`补货方案 ${spec.planId} 不存在，拒绝撤回`);
+  if (plan.status !== 'executed') throw new BizError(`补货方案 ${spec.planId} 尚未执行，不能撤回`);
+  if (plan.withdrawnBy !== undefined)
+    throw new BizError(
+      `补货方案 ${spec.planId} 已由撤回请求 ${plan.withdrawnBy} 整案撤回，每案最多成功撤回一次，拒绝再次撤回`,
+    );
+
+  // 子单映射逐一对应：为每条调拨指定冲销单号、每张采购指定取消单号，无缺漏、多余，顺序无关
+  const problems: string[] = [];
+  for (const docId of spec.transferRevs.keys()) {
+    if (!plan.transfers.some((t) => t.docId === docId))
+      problems.push(`调拨映射 ${docId} 不是方案 ${spec.planId} 的调拨子单（多余项）`);
+  }
+  for (const t of plan.transfers) {
+    if (!spec.transferRevs.has(t.docId)) problems.push(`缺少调拨子单 ${t.docId} 的冲销单号（缺漏项）`);
+  }
+  for (const poId of spec.purchaseCancels.keys()) {
+    if (!plan.purchases.some((p) => p.poId === poId))
+      problems.push(`采购映射 ${poId} 不是方案 ${spec.planId} 的采购子单（多余项）`);
+  }
+  for (const p of plan.purchases) {
+    if (!spec.purchaseCancels.has(p.poId)) problems.push(`缺少采购子单 ${p.poId} 的取消单号（缺漏项）`);
+  }
+  if (problems.length > 0)
+    throw new BizError(`撤回映射与方案 ${spec.planId} 的子单不逐一对应，整案拒绝：\n${problems.join('\n')}`);
+
+  // 请求及新子单编号共用全局单据编号空间，彼此不得重号；已占编号即使内容相同也拒绝（不接管）
+  const newIds = new Map<string, string>([[spec.reqId, '撤回请求编号']]);
+  const claim = (id: string, use: string): void => {
+    const prev = newIds.get(id);
+    if (prev !== undefined)
+      throw new BizError(`编号 ${id} 同时用作${prev}与${use}，请求及新子单编号彼此不得重号，整案拒绝`);
+    newIds.set(id, use);
+  };
+  for (const [docId, revId] of spec.transferRevs) claim(revId, `调拨子单 ${docId} 的冲销单号`);
+  for (const [poId, canId] of spec.purchaseCancels) claim(canId, `采购子单 ${poId} 的取消单号`);
+  for (const [id, use] of newIds) {
+    if (id === spec.reqId) continue; // 请求编号占用已在前面检查
+    if (
+      store.docs[id] !== undefined || store.arrivals[id] !== undefined ||
+      store.cancels[id] !== undefined || store.returns[id] !== undefined ||
+      store.poTransfers[id] !== undefined || store.reversals[id] !== undefined ||
+      store.planWithdrawals[id] !== undefined
+    )
+      throw new BizError(`${use} ${id} 已被占用（即使内容相同也拒绝，不接管已有单据），整案拒绝`);
+  }
+
+  // 撤回条件：各调拨子单须未冲销；各采购子单所有商品须全量待收（精确净进度，不核对快照）
+  const revOfOrig = nullProto<Record<string, string>>();
+  for (const [revId, rec] of Object.entries(store.reversals)) revOfOrig[rec.orig] = revId;
+  for (const t of plan.transfers) {
+    const revId = revOfOrig[t.docId];
+    if (revId !== undefined)
+      throw new BizError(`调拨子单 ${t.docId} 已被冲销单 ${revId} 冲销，不满足撤回条件，整案拒绝`);
+  }
+  for (const p of plan.purchases) {
+    const { effective, cancelled } = purchaseProgress(store, p.poId);
+    const got = effective[p.product] ?? 0n;
+    const can = cancelled[p.product] ?? 0n;
+    if (got !== 0n || can !== 0n)
+      throw new BizError(
+        `采购子单 ${p.poId} 商品 ${p.product} 已非全量待收（有效到货 ${got}，有效取消 ${can}），` +
+          `不满足撤回条件，整案拒绝`,
+      );
+  }
+
+  // 模拟执行：在当前余量上冲销全部调拨（追加普通冲销流水），取消全部采购的完整订购量
+  // （待收归零，不改库存与流水）。任一子单缺货、溢出或进度不符，整案不留任何变动。
+  const ledger = new Ledger(store);
+  const lines: string[] = [];
+  for (const t of plan.transfers) {
+    const revId = spec.transferRevs.get(t.docId)!;
+    const outcome = ledger.applyReversal(revId, t.docId);
+    for (const l of outcome.lines) lines.push(`撤回调拨 子单=${t.docId} 冲销单=${revId}：${l}`);
+  }
+  for (const p of plan.purchases) {
+    const canId = spec.purchaseCancels.get(p.poId)!;
+    ledger.applyCancel({ canId, poId: p.poId, items: new Map([[p.product, p.qty]]) });
+    lines.push(
+      `撤回采购 子单=${p.poId} 取消单=${canId}：商品 ${p.product} 取消完整订购量 ${p.qty}，` +
+        `待到货 ${p.qty} -> 0（取消不改库存与流水）`,
+    );
+  }
+
+  // 登记撤回：撤回标记、撤回请求记录与全部子单、冲销关系一次原子保存后才报成功
+  plan.withdrawnBy = spec.reqId;
+  const transferRevs = nullProto<Record<string, string>>();
+  for (const t of plan.transfers) transferRevs[t.docId] = spec.transferRevs.get(t.docId)!;
+  const purchaseCancels = nullProto<Record<string, string>>();
+  for (const p of plan.purchases) purchaseCancels[p.poId] = spec.purchaseCancels.get(p.poId)!;
+  const rec: PlanWithdrawalRecord = {
+    reqId: spec.reqId, planId: spec.planId, transferRevs, purchaseCancels, resultLines: lines,
+  };
+  store.planWithdrawals[spec.reqId] = rec;
+  ledger.commit(dataDir);
+
+  console.log(withdrawHeader(rec));
+  for (const line of lines) console.log(line);
+}
+
 function runPlan(rest: string[], dataDir: string, store: Store): void {
   const sub = rest[0];
   const tokens = rest.slice(1);
   if (sub === 'save') {
     runPlanSave(tokens, dataDir, store);
+    return;
+  }
+  if (sub === 'withdraw') {
+    runPlanWithdraw(tokens, dataDir, store);
     return;
   }
   if (sub === 'execute' || sub === 'exec') {
@@ -3918,11 +4285,13 @@ function runPlan(rest: string[], dataDir: string, store: Store): void {
     const planId = trimOrThrow('方案编号', planRaw);
     const plan = store.plans[planId];
     if (plan === undefined) throw new BizError(`补货方案 ${planId} 不存在`);
-    printPlan(plan);
-    if (plan.status === 'executed')
-      console.log('子单已落单，可通过 balance、flow、po show 查询真实结果。');
-    else
+    printPlan(plan, store);
+    if (plan.status !== 'executed')
       console.log('首次执行前将按值核对冻结快照：规则增删、实存或待到货合计任一变化整案拒绝。');
+    else if (plan.withdrawnBy !== undefined)
+      console.log('方案已整案撤回：调拨子单已冲销、采购子单已取消；plan execute 与原子单重放仍返回原结果，新取消单可按普通规则冲销，方案不能再次撤回。');
+    else
+      console.log('子单已落单，可通过 balance、flow、po show 查询真实结果。');
     return;
   }
   if (sub === 'list' || sub === 'ls') {
@@ -3936,13 +4305,15 @@ function runPlan(rest: string[], dataDir: string, store: Store): void {
     }
     for (const id of ids) {
       const plan = store.plans[id];
-      console.log(
-        `${id}\t${plan.status === 'executed' ? '已执行' : '待执行'}\t调拨 ${plan.transfers.length} 份\t采购 ${plan.purchases.length} 份`,
-      );
+      const status =
+        plan.status !== 'executed' ? '待执行'
+        : plan.withdrawnBy !== undefined ? `已撤回（请求 ${plan.withdrawnBy}）`
+        : '已执行';
+      console.log(`${id}\t${status}\t调拨 ${plan.transfers.length} 份\t采购 ${plan.purchases.length} 份`);
     }
     return;
   }
-  throw new UsageError(sub === undefined ? '用法：plan <save|show|list|execute> …' : `未知 plan 子命令：${sub}`);
+  throw new UsageError(sub === undefined ? '用法：plan <save|show|list|execute|withdraw> …' : `未知 plan 子命令：${sub}`);
 }
 
 function runArrival(rest: string[], dataDir: string, store: Store): void {
@@ -4111,6 +4482,9 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   plan show <方案编号>                        查看补货方案明细与待执行/已执行状态
   plan list                                   列出全部补货方案
   plan execute <方案编号>                     一次性落单：核对照快照后生成全部调拨单与采购单（原子）
+  plan withdraw <请求编号> --plan <方案编号>
+        --transfer <调拨子单编号>:<冲销单号> [...]
+        --purchase <采购子单编号>:<取消单号> [...]     整案撤回已执行方案：冲销全部调拨、取消全部采购（原子）
   balance <商品编号> [--wh <仓库>]           查询余量；省略 --wh 查询各仓
   flow --product <编号> [--wh <仓库>]        按商品/仓库查询流水（至少一个过滤条件）
        | --wh <仓库> [--product <编号>]
@@ -4266,6 +4640,19 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   失败不留本次库存、采购、流水、编号或执行标记，方案保留待执行可重试。已
   执行方案重放只返回原落单结果，不再核对、不再生效、不改写文件；其子单后
   来冲销、取消或到货也不重建。
+  plan withdraw 整案撤回已执行且未撤回的方案：提供撤回请求编号与方案编号，
+  并为每条调拨子单指定冲销单号（--transfer 子单编号:冲销单号）、为每张采
+  购子单指定取消单号（--purchase 子单编号:取消单号），逐一对应、无缺漏多
+  余或重复，顺序无关。请求编号与新子单编号共用全局单据编号空间、彼此不得
+  重号，已占编号即使内容相同也拒绝（不接管）；撤回请求本身不可冲销。撤回
+  条件：各调拨子单未冲销，各采购子单所有商品全量待收（有效到货与有效取消
+  均为零，按精确净进度判断，不核对快照，规则变化不阻止）。成功在当前余量
+  上冲销全部调拨（追加普通冲销流水），并取消全部采购的完整订购量、待收归
+  零（不改库存与流水）；不恢复库存快照、不删除原单或后续业务。缺货、溢出、
+  进度不符或编号冲突均整案拒绝并说明子单与原因，本次一切变动与标记不保留、
+  不占编号，可同号重试。每案最多成功撤回一次；同请求编号、同方案及子单映
+  射重放返回原结果，不再校验、生效或改写文件。撤回后 plan execute 与原子
+  单重放仍返回原结果；新取消单可按普通规则冲销，但方案保持已撤回。
 
 期间库存对账报表：
   recon 生成可追溯的期间库存对账报表（只读，不创建或改写数据、历史结果及关联）。
@@ -4315,6 +4702,7 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   node app.ts -d ./data plan show PL1
   node app.ts -d ./data plan list
   node app.ts -d ./data plan execute PL1
+  node app.ts -d ./data plan withdraw WD1 --plan PL1 --transfer T1:RT1 --purchase PO9:CX1
   node app.ts -d ./data balance P1
   node app.ts -d ./data balance P1 --wh W1
   node app.ts -d ./data flow --product P1
