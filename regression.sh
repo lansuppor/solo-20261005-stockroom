@@ -1048,5 +1048,263 @@ node "$APP" -d "$D20" balance P1 >/dev/null
 [ ! -e "$D20/.stockroom.json.lock" ] && echo "ok   - 只读查询不创建锁文件" || { echo "FAIL - 只读查询创建了锁文件"; FAIL=1; }
 unset STOCKROOM_LOCK_WAIT_MS
 
+echo "== 14. 异常退出并发恢复：多回收者竞争、未写完持有者信息、释放归属与崩溃重试 =="
+unset STOCKROOM_LOCK_WAIT_MS
+
+# 取一个确认已退出的进程号（PID 复用窗口在本地短时回归中可忽略）。
+dead_pid() {
+  sh -c 'true' & dp=$!
+  wait "$dp"
+  echo "$dp"
+}
+
+# 手工布置一个“已退出持有者”的新协议锁（身份文件硬链接到闸门），随后多个写请求同时回收。
+setup_dead_lock() { # setup_dead_lock <数据目录>
+  d=$1
+  mkdir -p "$d"
+  dead=$(dead_pid)
+  touch "$d/.stockroom.json.lock.$dead.dead0"
+  ln "$d/.stockroom.json.lock.$dead.dead0" "$d/.stockroom.json.lock"
+}
+
+echo "-- 14.1 多个恢复者竞争同一遗留占用：只能串行取得写入机会，单据全部入库、流水连续 --"
+D30="$TMP/data30"
+node "$APP" -d "$D30" product add P1 螺丝 >/dev/null
+setup_dead_lock "$D30"
+: > "$TMP/recover.res"
+i=1
+while [ $i -le 6 ]; do
+  ( node "$APP" -d "$D30" in "RC$i" --wh W1 --item P1:$i >/dev/null 2>&1; echo "rc$i=$?" ) >> "$TMP/recover.res" &
+  i=$((i+1))
+done
+wait
+nfail=$(grep -c '=1$' "$TMP/recover.res" || true)
+[ "$nfail" -eq 0 ] && echo "ok   - 6 个恢复者全部成功取得写入机会（串行回收，无失败）" || { echo "FAIL - 有恢复者失败：$(cat "$TMP/recover.res")"; FAIL=1; }
+out=$(node "$APP" -d "$D30" balance P1 --wh W1)
+check "6 个恢复者的成功入库全部计入余量（1+2+3+4+5+6=21）" "余量：商品 P1 仓库 W1 = 21" "$out"
+nflow=$(node "$APP" -d "$D30" flow --product P1 --wh W1 | grep -c '^#')
+[ "$nflow" -eq 6 ] && echo "ok   - 恢复后每笔各一条流水（共 6 条），编号全部保留" || { echo "FAIL - 流水条数异常：$nflow"; FAIL=1; }
+# 流水序号 1..6 连续，且六笔编号恰为 RC1..RC6（提交顺序不要求与启动顺序一致）
+seqs=$(node "$APP" -d "$D30" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 3 4 5 6 " ] && echo "ok   - 恢复后流水序号 1..6 连续" || { echo "FAIL - 流水序号不连续：$seqs"; FAIL=1; }
+docs=$(node "$APP" -d "$D30" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "RC1 RC2 RC3 RC4 RC5 RC6 " ] && echo "ok   - 六笔编号 RC1..RC6 全部保留" || { echo "FAIL - 流水编号异常：$docs"; FAIL=1; }
+nlocks=$(ls -a "$D30" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 全部结束后锁闸门与身份文件均释放" || { echo "FAIL - 仍有协调文件残留：$(ls -a "$D30")"; FAIL=1; }
+# 整批导入在遗留锁恢复后仍作为完整事务办理（与其他写入不交错）
+cat > "$TMP/imp30.json" <<'EOF'
+[
+  {"type":"in","id":"BI30a","wh":"W1","items":[{"product":"P1","qty":100}]},
+  {"type":"out","id":"BI30b","wh":"W1","items":[{"product":"P1","qty":1}]}
+]
+EOF
+setup_dead_lock "$D30"
+out=$(node "$APP" -d "$D30" import --file "$TMP/imp30.json")
+check "遗留锁恢复后整批导入作为完整事务生效" "首次生效 2 项" "$out"
+check "导入后余量精确（21+100-1=120）" "余量：商品 P1 仓库 W1 = 120" "$(node "$APP" -d "$D30" balance P1 --wh W1)"
+
+echo "-- 14.2 回收者不得移走另一个请求刚取得的占用（回收/释放交错）--"
+D31="$TMP/data31"
+node "$APP" -d "$D31" product add P1 螺丝 >/dev/null
+# 一批请求竞争回收死锁，再混入第二批新请求交错执行；最终结果必须等价某一串行顺序
+setup_dead_lock "$D31"
+: > "$TMP/interleave.res"
+i=1
+while [ $i -le 4 ]; do
+  ( node "$APP" -d "$D31" in "IL$i" --wh W1 --item P1:1 >/dev/null 2>&1; echo "il$i=$?" ) >> "$TMP/interleave.res" &
+  i=$((i+1))
+done
+sleep 0.05
+i=5
+while [ $i -le 8 ]; do
+  ( node "$APP" -d "$D31" in "IL$i" --wh W1 --item P1:1 >/dev/null 2>&1; echo "il$i=$?" ) >> "$TMP/interleave.res" &
+  i=$((i+1))
+done
+wait
+nfail=$(grep -c '=1$' "$TMP/interleave.res" || true)
+[ "$nfail" -eq 0 ] && echo "ok   - 交错两批共 8 个请求全部成功（无错删他人占用导致的失败）" || { echo "FAIL - 交错请求有失败：$(cat "$TMP/interleave.res")"; FAIL=1; }
+out=$(node "$APP" -d "$D31" balance P1 --wh W1)
+check "交错恢复/释放后余量精确（8 笔各 1）" "余量：商品 P1 仓库 W1 = 8" "$out"
+
+echo "-- 14.3 持有者信息未写完时暂停超过两秒不被接管；退出后自动恢复 --"
+D32="$TMP/data32"
+node "$APP" -d "$D32" product add P1 螺丝 >/dev/null
+# 存活持有者：闸门为空内容（身份文件名已携带 pid），维持 5 秒
+sleep 5 & HOLDER=$!
+touch "$D32/.stockroom.json.lock.$HOLDER.h0"
+ln "$D32/.stockroom.json.lock.$HOLDER.h0" "$D32/.stockroom.json.lock"
+( STOCKROOM_LOCK_WAIT_MS=400 node "$APP" -d "$D32" in WAIT1 --wh W1 --item P1:1 >/dev/null 2>&1; echo "waiter1=$?" ) > "$TMP/holder-wait.res" &
+WPID=$!
+wait $WPID
+case $(cat "$TMP/holder-wait.res") in
+  "waiter1=1") echo "ok   - 暂停超过两秒且内容为空，存活持有者仍不被接管（等待者超时退出 1）" ;;
+  *) echo "FAIL - 等待者结果异常：$(cat "$TMP/holder-wait.res")"; FAIL=1 ;;
+esac
+out=$(STOCKROOM_LOCK_WAIT_MS=400 node "$APP" -d "$D32" in WAIT2 --wh W1 --item P1:1 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 第二个等待者同样不抢占存活锁" || { echo "FAIL - 第二等待者异常：$out"; FAIL=1; }
+check "等待期间余量始终为 0" "商品 P1 在各仓库余量均为 0" "$(node "$APP" -d "$D32" balance P1)"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+out=$(node "$APP" -d "$D32" in AFTER --wh W1 --item P1:2); code=$?
+[ $code -eq 0 ] && echo "ok   - 持有者退出后后续请求自动恢复，无需手工删文件" || { echo "FAIL - 退出后未自动恢复：$out"; FAIL=1; }
+check "恢复后的提交正常入库" "余量：商品 P1 仓库 W1 = 2" "$(node "$APP" -d "$D32" balance P1 --wh W1)"
+[ ! -e "$D32/.stockroom.json.lock" ] && echo "ok   - 恢复写入结束后闸门释放" || { echo "FAIL - 闸门残留"; FAIL=1; }
+
+echo "-- 14.4 释放归属：业务拒绝/失败只释放自己的占用，删除别人的锁不得影响他人 --"
+D33="$TMP/data33"
+node "$APP" -d "$D33" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D33" in OK1 --wh W1 --item P1:5 >/dev/null
+# 业务拒绝（缺货）后锁必须释放，后续写入立即可得
+node "$APP" -d "$D33" out BAD1 --wh W1 --item P1:99 >/dev/null 2>&1
+out=$(node "$APP" -d "$D33" in OK2 --wh W1 --item P1:1)
+check "业务失败后释放归属正确，后续写入立即可用" "入库单 OK2 提交成功" "$out"
+# 手工放置一个死 pid 身份文件（非闸门，不参与占用），持有者写入时应清理且不动自己的文件
+dead=$(dead_pid)
+touch "$D33/.stockroom.json.lock.$dead.orphan"
+node "$APP" -d "$D33" in OK3 --wh W1 --item P1:1 >/dev/null
+[ ! -e "$D33/.stockroom.json.lock.$dead.orphan" ] && echo "ok   - 取得写入机会后清理已退出进程的孤立身份文件" || { echo "FAIL - 孤立身份文件未清理"; FAIL=1; }
+nlocks=$(ls -a "$D33" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 清理不误伤，正常结束后无任何锁文件残留" || { echo "FAIL - 锁文件残留：$(ls -a "$D33")"; FAIL=1; }
+
+echo "-- 14.5 原子替换前异常退出：不生效；遗留临时内容不算提交；存活临时文件不被清除 --"
+D34="$TMP/data34"
+node "$APP" -d "$D34" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D34" in BASE --wh W1 --item P1:3 >/dev/null
+# 存活请求的临时文件：写一个带存活 pid 的遗留临时名，恢复写入不得删除
+sleep 60 & KEEP=$!
+touch "$D34/.stockroom.json.$KEEP.keep.tmp"
+STOCKROOM_TEST_CRASH=before-tmp node "$APP" -d "$D34" in CRASH1 --wh W1 --item P1:100 >/dev/null 2>&1
+# 进程已被 SIGKILL：留下死锁，后续写请求恢复
+out=$(node "$APP" -d "$D34" in AGAIN1 --wh W1 --item P1:1); code=$?
+[ $code -eq 0 ] && echo "ok   - 替换前崩溃后自动恢复且新请求成功" || { echo "FAIL - 崩溃后恢复失败：$out"; FAIL=1; }
+check "崩溃请求未生效（余量仍为 3+1=4）" "余量：商品 P1 仓库 W1 = 4" "$(node "$APP" -d "$D34" balance P1 --wh W1)"
+[ -e "$D34/.stockroom.json.$KEEP.keep.tmp" ] && echo "ok   - 存活请求的临时文件未被清除" || { echo "FAIL - 存活临时文件被误删"; FAIL=1; }
+kill "$KEEP" 2>/dev/null; wait "$KEEP" 2>/dev/null
+# 死 pid 的遗留临时文件（内容为损坏 JSON）不算提交，且在下次取得写入机会时清理
+printf '{not json' > "$D34/.stockroom.json.999999.leftover.tmp"
+out=$(node "$APP" -d "$D34" in AGAIN2 --wh W1 --item P1:1); code=$?
+[ $code -eq 0 ] && echo "ok   - 死进程遗留损坏临时文件不影响提交" || { echo "FAIL - 遗留临时文件阻断提交：$out"; FAIL=1; }
+[ ! -e "$D34/.stockroom.json.999999.leftover.tmp" ] && echo "ok   - 死进程遗留临时文件已清理" || { echo "FAIL - 遗留临时文件未清理"; FAIL=1; }
+check "损坏临时内容从未被当作已提交数据（余量 5）" "余量：商品 P1 仓库 W1 = 5" "$(node "$APP" -d "$D34" balance P1 --wh W1)"
+# 写临时文件之后、rename 之前崩溃同样不生效
+STOCKROOM_TEST_CRASH=after-tmp node "$APP" -d "$D34" in CRASH2 --wh W1 --item P1:100 >/dev/null 2>&1
+out=$(node "$APP" -d "$D34" in CRASH2 --wh W1 --item P1:7)
+check "rename 前崩溃：同号重试作为新提交生效（此前不占编号）" "入库单 CRASH2 提交成功" "$out"
+check "重试入库 7 件后余量为 12" "余量：商品 P1 仓库 W1 = 12" "$(node "$APP" -d "$D34" balance P1 --wh W1)"
+
+echo "-- 14.6 原子替换后异常退出（未输出成功）：完整提交保留，重试返回原结果、不改写文件 --"
+D35="$TMP/data35"
+node "$APP" -d "$D35" product add P1 螺丝 >/dev/null
+STOCKROOM_TEST_CRASH=after-rename node "$APP" -d "$D35" in LUCKY --wh W1 --item P1:9 >/dev/null 2>&1
+# 崩溃发生在 rename 之后：数据文件应已含完整提交
+check "替换后崩溃：提交已落盘（余量 9）" "余量：商品 P1 仓库 W1 = 9" "$(node "$APP" -d "$D35" balance P1 --wh W1)"
+sum1=$(cksum < "$D35/stockroom.json")
+out=$(node "$APP" -d "$D35" in LUCKY --wh W1 --item P1:9)
+check "未输出成功的提交重试返回原结果（重复提交）" "为重复提交" "$out"
+sum2=$(cksum < "$D35/stockroom.json")
+[ "$sum1" = "$sum2" ] && echo "ok   - 崩溃后重放不改写数据文件" || { echo "FAIL - 重放改写了文件"; FAIL=1; }
+check "重放不重复生效（余量仍为 9）" "余量：商品 P1 仓库 W1 = 9" "$(node "$APP" -d "$D35" balance P1 --wh W1)"
+# 恢复后的流水连续且编号保留
+nflow=$(node "$APP" -d "$D35" flow --product P1 --wh W1 | grep -c '^#')
+[ "$nflow" -eq 1 ] && echo "ok   - 崩溃提交的流水保留（仅 1 条，重放不追加）" || { echo "FAIL - 流水条数异常 $nflow"; FAIL=1; }
+
+echo "-- 14.7 忙目录中的用法错误：等待前退出 2 且不创建协调文件；等待配置边界 --"
+D36="$TMP/data36"
+mkdir -p "$D36"
+sleep 45 & BUSY=$!
+touch "$D36/.stockroom.json.lock.$BUSY.b0"
+ln "$D36/.stockroom.json.lock.$BUSY.b0" "$D36/.stockroom.json.lock"
+t0=$(date +%s%N)
+out=$(STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D36" in 2>&1); code=$?
+t1=$(date +%s%N); ms=$(( (t1-t0)/1000000 ))
+if [ $code -eq 2 ] && [ $ms -lt 1000 ]; then
+  echo "ok   - 忙目录中缺参数仍立即退出 2（${ms}ms），不等待"
+else
+  echo "FAIL - 忙目录用法错误异常（code=$code, ${ms}ms）：$out"; FAIL=1
+fi
+out=$(STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D36" product add 2>&1); code=$?
+[ $code -eq 2 ] && echo "ok   - 忙目录中缺名称退出 2" || { echo "FAIL - code=$code $out"; FAIL=1; }
+out=$(STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D36" arrival A1 --po PO1 2>&1); code=$?
+[ $code -eq 2 ] && echo "ok   - 忙目录中缺明细退出 2" || { echo "FAIL - code=$code $out"; FAIL=1; }
+out=$(STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D36" in D1 --wh W1 --item P1:1 --bogus 2>&1); code=$?
+[ $code -eq 2 ] && echo "ok   - 忙目录中未知选项退出 2" || { echo "FAIL - code=$code $out"; FAIL=1; }
+nnew=$(ls -a "$D36" | grep -c '^\.stockroom\.json\.lock\.' || true)
+[ "$nnew" -eq 1 ] && echo "ok   - 用法错误未创建本请求的协调文件（仅原占用者身份文件）" || { echo "FAIL - 协调文件异常：$(ls -a "$D36")"; FAIL=1; }
+# 状态校验仍在取得写入机会后：忙目录中对“编号冲突/缺货”等应等待到超时（退出 1），而非退出 2
+out=$(STOCKROOM_LOCK_WAIT_MS=150 node "$APP" -d "$D36" in D1 --wh W1 --item P1:1 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 库存状态校验仍在取得写入机会后（忙时超时退出 1）" || { echo "FAIL - code=$code $out"; FAIL=1; }
+# 等待配置边界：非法/超范围在等待前退出 2
+for bad in abc -1 1.5 '' 9007199254740992 99999999999999999999 ' 12'; do
+  out=$(STOCKROOM_LOCK_WAIT_MS="$bad" node "$APP" -d "$D36" in Z1 --wh W1 --item P1:1 2>&1); code=$?
+  [ $code -eq 2 ] && echo "ok   - 非法等待配置 '$bad' 退出 2（不转无限等待）" || { echo "FAIL - '$bad' code=$code：$out"; FAIL=1; }
+done
+# 0 = 仅立即尝试：忙目录立即退出 1
+t0=$(date +%s%N)
+out=$(STOCKROOM_LOCK_WAIT_MS=0 node "$APP" -d "$D36" in Z2 --wh W1 --item P1:1 2>&1); code=$?
+t1=$(date +%s%N); ms=$(( (t1-t0)/1000000 ))
+if [ $code -eq 1 ] && [ $ms -lt 500 ]; then
+  echo "ok   - 等待 0 毫秒仅立即尝试，忙目录立即退出 1（${ms}ms）"
+else
+  echo "FAIL - 零等待异常（code=$code, ${ms}ms）：$out"; FAIL=1
+fi
+kill "$BUSY" 2>/dev/null; wait "$BUSY" 2>/dev/null
+# 占用者退出后，所有被拒请求可正常重试，结果齐全
+node "$APP" -d "$D36" product add P1 螺丝 >/dev/null
+out=$(node "$APP" -d "$D36" in Z2 --wh W1 --item P1:4)
+check "忙目录恢复后请求可成功" "入库单 Z2 提交成功" "$out"
+check "忙目录恢复后余量正确（4）" "余量：商品 P1 仓库 W1 = 4" "$(node "$APP" -d "$D36" balance P1 --wh W1)"
+
+echo "-- 14.8 恢复后竞争结果核对：竞争库存/采购待收不超量、同号去重、失败后已提交仍在 --"
+D37="$TMP/data37"
+node "$APP" -d "$D37" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D37" po register PO1 --supplier S1 --wh W1 --item P1:5 >/dev/null
+setup_dead_lock "$D37"
+: > "$TMP/rec-race.res"
+# 4 个到货请求各抢 2 件（待收 5），只能 2 个成功、2 个超量拒绝；另加 2 个同号同内容请求只生效一次
+( node "$APP" -d "$D37" arrival RA1 --po PO1 --item P1:2 >/dev/null 2>&1; echo "a1=$?" ) >> "$TMP/rec-race.res" &
+( node "$APP" -d "$D37" arrival RA2 --po PO1 --item P1:2 >/dev/null 2>&1; echo "a2=$?" ) >> "$TMP/rec-race.res" &
+( node "$APP" -d "$D37" arrival RA3 --po PO1 --item P1:2 >/dev/null 2>&1; echo "a3=$?" ) >> "$TMP/rec-race.res" &
+( node "$APP" -d "$D37" arrival RA4 --po PO1 --item P1:2 >/dev/null 2>&1; echo "a4=$?" ) >> "$TMP/rec-race.res" &
+( node "$APP" -d "$D37" arrival DUPA --po PO1 --item P1:1 >/dev/null 2>&1; echo "d1=$?" ) >> "$TMP/rec-race.res" &
+( node "$APP" -d "$D37" arrival DUPA --po PO1 --item P1:1 >/dev/null 2>&1; echo "d2=$?" ) >> "$TMP/rec-race.res" &
+wait
+codes=$(sed 's/^[a-z0-9]*=//' "$TMP/rec-race.res" | sort | tr '\n' ' ')
+# 合法串行结果固定为 4 个退出 0（恰两笔新到货共 4 件 + DUPA 1 件 + DUPA 重放）、
+# 2 个退出 1（另外两笔到货超量拒绝）；具体哪两个 RA 编号胜出不做要求。
+case "$codes" in
+  0\ 0\ 0\ 0\ 1\ 1\ ) : ;;
+  *) echo "FAIL - 恢复竞争出现异常退出码（只应有 4 个 0、2 个 1）：$(cat "$TMP/rec-race.res")"; FAIL=1 ;;
+esac
+ndup=$(grep -c '^d[12]=0$' "$TMP/rec-race.res" || true)
+[ "$ndup" -eq 2 ] && echo "ok   - 同号同内容两个请求都成功返回（其一为去重重放）" || { echo "FAIL - 同号请求退出码异常：$(cat "$TMP/rec-race.res")"; FAIL=1; }
+nra_ok=$(grep -E '^a[0-9]=0$' "$TMP/rec-race.res" | wc -l | tr -d ' ')
+nra_no=$(grep -E '^a[0-9]=1$' "$TMP/rec-race.res" | wc -l | tr -d ' ')
+[ "$nra_ok" -eq 2 ] && [ "$nra_no" -eq 2 ] \
+  && echo "ok   - 竞争采购待收恰好两笔新到货成功（4 件）、两笔超量拒绝，不超量" \
+  || { echo "FAIL - 到货竞争成败数异常（成功 $nra_ok 拒绝 $nra_no）"; FAIL=1; }
+check "恢复竞争后采购精确收齐、无超收" "P1	5	5	0	收齐" "$(node "$APP" -d "$D37" po show PO1 | grep -E '^P1	')"
+# 状态校验在取得写入机会后：同号不同内容按原规则拒绝（先确定性地成功提交 SDD1）
+node "$APP" -d "$D37" po register PO2 --supplier S2 --wh W2 --item P1:10 >/dev/null
+node "$APP" -d "$D37" arrival SDD1 --po PO2 --item P1:2 >/dev/null
+setup_dead_lock "$D37"
+: > "$TMP/rec-conf.res"
+( node "$APP" -d "$D37" arrival SDD1 --po PO2 --item P1:3 >/dev/null 2>&1; echo "c1=$?" ) >> "$TMP/rec-conf.res" &
+( node "$APP" -d "$D37" arrival SDD1 --po PO2 --item P1:4 >/dev/null 2>&1; echo "c2=$?" ) >> "$TMP/rec-conf.res" &
+wait
+# SDD1 已成功（2 件）：同号不同内容两个请求都必须拒绝，且不改变已提交结果
+sort "$TMP/rec-conf.res" | tr '\n' ' ' | grep -q 'c1=1 c2=1' \
+  && echo "ok   - 回收/释放交错下同号不同内容两个请求均拒绝（退出 1）" \
+  || { echo "FAIL - 同号冲突结果异常：$(cat "$TMP/rec-conf.res")"; FAIL=1; }
+# 同号同内容重放仍返回原结果，不改进度
+out=$(node "$APP" -d "$D37" arrival SDD1 --po PO2 --item P1:2)
+check "SDD1 同号同内容重放返回原结果" "为重复提交" "$out"
+check "重放不改变 PO2 进度（有效到货仍为 2）" "P1	10	2	8	部分到货" "$(node "$APP" -d "$D37" po show PO2 | grep -E '^P1	')"
+check "PO1 已提交状态不受冲突请求影响（仍收齐）" "P1	5	5	0	收齐" "$(node "$APP" -d "$D37" po show PO1 | grep -e '^P1	')"
+# 失败后再写立即可用（锁归属正确释放）
+node "$APP" -d "$D37" product add P2 螺母 >/dev/null
+out=$(node "$APP" -d "$D37" product list)
+check "失败后的已提交状态与后续写入均正常" "P2	螺母" "$out"
+nlocks=$(ls -a "$D37" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 回收/释放交错后无锁文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D37")"; FAIL=1; }
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi

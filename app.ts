@@ -1,8 +1,21 @@
 #!/usr/bin/env node
 // stockroom —— 本地多仓库存台账（Node.js 24，TypeScript，无外部运行依赖）
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  fsyncSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { join, resolve } from 'node:path';
 
 const APP_NAME = 'stockroom';
 const DATA_FILENAME = 'stockroom.json';
@@ -1124,12 +1137,34 @@ function validateStore(data: unknown): Store {
 
 function saveStore(dataDir: string, store: Store): void {
   const path = dataPath(dataDir);
-  const tmp = join(dataDir, `.${DATA_FILENAME}.${process.pid}.tmp`);
+  // 临时文件名携带进程号与随机标识：同进程多次保存互不覆盖，崩溃后的遗留文件
+  // 也能凭进程号确认持有者已退出后再清理，绝不清除存活请求的临时文件。
+  const tmp = join(dataDir, `.${DATA_FILENAME}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+  // 仅供本地回归检查使用的崩溃注入点（未设置时完全无作用）：
+  //   before-tmp  原子替换前（尚未写临时文件）被 kill，遗留锁、业务不生效
+  //   after-tmp   临时文件写完、rename 之前被 kill，遗留锁与临时文件、业务不生效
+  //   after-rename 原子替换之后、输出成功之前被 kill，完整提交保留
+  const crashPoint = process.env.STOCKROOM_TEST_CRASH;
+  if (crashPoint === 'before-tmp') process.kill(process.pid, 'SIGKILL');
+  let fd: number;
   try {
     mkdirSync(dataDir, { recursive: true });
-    writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', 'utf8');
+    fd = openSync(tmp, 'wx'); // 原子创建：同名（极小概率）直接失败而不是覆盖他人内容
+    try {
+      writeFileSync(fd, JSON.stringify(store, null, 2) + '\n', 'utf8');
+      fsyncSync(fd); // 内容落盘后再 rename，保证替换后即完整提交
+    } finally {
+      closeSync(fd);
+    }
+    if (crashPoint === 'after-tmp') process.kill(process.pid, 'SIGKILL');
     renameSync(tmp, path);
+    if (crashPoint === 'after-rename') process.kill(process.pid, 'SIGKILL');
   } catch (e) {
+    try {
+      unlinkSync(tmp); // 写入失败不留下本请求的半成品临时文件
+    } catch {
+      /* 临时文件不存在也无妨 */
+    }
     throw new DataError(`保存数据失败，已有数据保持不变：${(e as Error).message}`);
   }
 }
@@ -1139,28 +1174,64 @@ function saveStore(dataDir: string, store: Store): void {
 // 同一数据目录的写请求用目录内的锁文件串行化：取得写入机会后才读取最新已提交
 // 状态，业务校验、去重与原子保存（临时文件 + rename）都在持有锁期间完成，因此
 // 并发请求的最终结果等价于某个完整串行执行顺序，流水序号与该顺序一致。锁文件
-// 位于数据目录内部，相对、绝对及符号链接路径指向同一目录时自然共用同一把锁；
-// 不同目录各有自己的锁，互不阻塞。只读查询不创建也不检查锁文件。
+// 位于数据目录内部，相对、绝对及符号链接路径经 realpath 归一后指向同一目录时
+// 共用同一把锁；不同目录各有自己的锁，互不阻塞。只读查询不创建也不检查锁文件。
 //
-// 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按毫秒调整），
-// 超时明确报错并以退出码 1 结束。写进程异常退出（如被 kill）会留下锁文件：
-// 后续写请求发现锁中记录的进程号已不存在时自动接管，无需手工删除任何文件；
-// 仍存活的写进程无论写多久都不会被抢占。
+// 锁协议（固定闸门 + 按进程命名的身份文件 + 唯一回收协调者）：
+//   - 每个写进程先 O_EXCL 创建自己的身份文件
+//     .stockroom.json.lock.<pid>.<nonce> 并写完整持有者信息（pid 在“文件名”里，
+//     内容在发布前写好），再用 link() 把它硬链接到固定闸门名
+//     .stockroom.json.lock：闸门已存在时 link 原子失败（EEXIST），不存在时原子
+//     成功，谁也不会覆盖谁。
+//   - 判定占用：闸门存在时取其 inode，找到与之同 inode 的身份文件（或协调者
+//     文件），其记录的 pid 仍存活就一律等待——哪怕内容暂时不完整，或持有者建锁
+//     后暂停很久，文件年龄与内容完整度从不作为接管依据。
+//   - 持有者进程退出后闸门成为遗留物。多个等待者先竞争唯一的“回收协调者”文件
+//     .stockroom.json.lock.coord（硬链接原子认领，存活期间稳定唯一，死协调者按
+//     死 pid 回收）：只有协调者能动闸门。回收用一次原子“替换 rename”
+//     （rename(自己的身份文件, 闸门)）无缝完成——闸门名全程存在、inode 被整体
+//     换成新持有者，没有“闸门短暂缺失被他人插队”的空隙；非协调者一律等待。
+//     因此回收者绝不可能移走另一个请求刚取得的闸门，多个恢复者只能串行取得
+//     写入机会；结束或失败时也只释放本进程自己的闸门/身份/协调者文件。
+//   - 异常退出若发生在原子替换之前，本次业务变动完全不生效；发生在替换之后，
+//     完整提交已保留（即使来不及输出成功），重试按已有结果去重。遗留临时文件、
+//     身份/协调者文件与回收物凭 pid 确认持有者已退出后由后续写入者清理，
+//     存活请求的文件一律不动。
+//
+// 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按毫秒调整）：
+// 只接受十进制非负安全整数，0 表示仅尝试立即取得；非法或超出安全整数范围的
+// 配置在任何等待前报标准错误并以退出码 2 结束，绝不退化为无限等待。超时明确
+// 报错并以退出码 1 结束。
 
-const LOCK_FILENAME = `.${DATA_FILENAME}.lock`;
-const LOCK_TMP_PREFIX = `.${DATA_FILENAME}.`;
+const LOCK_GATE = `.${DATA_FILENAME}.lock`; // 固定闸门名（也兼容旧版单文件锁）
+const LOCK_COORD = `.${DATA_FILENAME}.lock.coord`; // 回收协调者（稳定、唯一）
+const LOCK_PREFIX = `.${DATA_FILENAME}.lock.`; // 各进程身份文件此前缀
+const COORD_PREFIX = `.${DATA_FILENAME}.lock.coord.reclaimed.`; // 死协调者回收物
+const RECLAIM_PREFIX = `.${DATA_FILENAME}.lock.reclaimed.`; // 旧版本闸门回收物
+const TMP_PREFIX = `.${DATA_FILENAME}.`;
 const LOCK_WAIT_DEFAULT_MS = 10_000;
 const LOCK_POLL_MS = 50;
-const LOCK_UNREADABLE_FRESH_MS = 2_000; // 内容尚未写入的锁在此宽限内视为“刚创建”，不抢占
+const COORD_POLL_MS = 30; // 等待现任回收协调者时的轮询间隔
 
 interface WriteLock {
   release(): void;
 }
 
+/** 解析并校验等待上限：仅接受纯十进制非负安全整数；0 = 仅立即尝试；非法配置抛用法错误（退出 2）。 */
 function lockWaitLimitMs(): number {
   const raw = process.env.STOCKROOM_LOCK_WAIT_MS;
-  if (raw !== undefined && /^\d+$/.test(raw)) return Number(raw);
-  return LOCK_WAIT_DEFAULT_MS;
+  if (raw === undefined) return LOCK_WAIT_DEFAULT_MS;
+  // 必须整体是数字（含空白、小数点、符号均拒绝），避免把非法值悄悄解释为 0 或无限等待
+  if (!/^\d+$/.test(raw))
+    throw new UsageError(
+      `环境变量 STOCKROOM_LOCK_WAIT_MS 必须是非负整数毫秒（0 表示仅尝试立即取得），实际为：${raw}`,
+    );
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n))
+    throw new UsageError(
+      `环境变量 STOCKROOM_LOCK_WAIT_MS 超出安全整数范围，拒绝启动（不能转换为无限等待）：${raw}`,
+    );
+  return n;
 }
 
 function pidAlive(pid: number): boolean {
@@ -1176,42 +1247,174 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/**
- * 读取现存锁文件并判断是否属于已退出的写进程：返回锁文件原文表示可安全接管；
- * 返回 null 表示锁被存活进程持有（或刚好被释放/替换，下一轮重试即可）。
- * 内容尚不可解析的锁视为“刚创建、内容未写完”，短暂宽限内不抢占，超过宽限按
- * 异常遗留处理。
- */
-function staleLockContent(path: string): string | null {
-  let content: string;
+/** 把（可能含符号链接的）数据目录归一为真实路径，使同一目录的不同写法共用一把锁。 */
+function resolveDataDir(dataDir: string): string {
   try {
-    content = readFileSync(path, 'utf8');
+    return realpathSync.native(dataDir);
   } catch {
-    return null;
-  }
-  const m = /^(\d+) /.exec(content);
-  if (m !== null) return pidAlive(Number(m[1])) ? null : content;
-  try {
-    return Date.now() - statSync(path).mtimeMs > LOCK_UNREADABLE_FRESH_MS ? content : null;
-  } catch {
-    return null;
+    // 目录尚不存在：先归一父目录（父目录本身可能是符号链接），再拼上待创建的末级
+    const abs = resolve(dataDir);
+    const slash = Math.max(abs.lastIndexOf('/'), 0);
+    const parent = abs.slice(0, slash) || '/';
+    const base = abs.slice(slash + 1);
+    try {
+      return join(realpathSync.native(parent), base);
+    } catch {
+      return abs;
+    }
   }
 }
 
-/** 清理异常退出写进程遗留的临时文件；其他存活写入的临时文件一律不动。 */
-function cleanStaleTmpFiles(dataDir: string): void {
+/** 读取锁身份文件名中的 pid（.stockroom.json.lock.<pid>.<nonce>）；无法解析返回 null。 */
+function lockNamePid(name: string): number | null {
+  if (!name.startsWith(LOCK_PREFIX)) return null;
+  const rest = name.slice(LOCK_PREFIX.length);
+  if (rest === 'coord' || rest.startsWith('coord.')) return null; // 协调者文件，不是任何进程的身份文件
+  const dot = rest.indexOf('.');
+  const part = dot < 0 ? rest : rest.slice(0, dot);
+  return /^\d+$/.test(part) ? Number(part) : null;
+}
+
+/**
+ * 尝试成为本目录唯一的“回收协调者”：把本进程的身份文件硬链接到固定协调者名。
+ * 返回 true 表示当选；false 表示已有存活协调者（调用方应等待，不得自行回收闸门）。
+ * 协调者在整个闸门持有期间保持唯一：其他进程在其存活期间只能等待，从根本上
+ * 杜绝两个回收者并发替换闸门。死协调者（其记录的 pid 已退出）原子 rename 回收
+ * 后重试一次，rename 竞争失败则放弃。
+ */
+function tryBecomeCoordinator(dir: string, idPath: string): boolean {
+  const coordPath = join(dir, LOCK_COORD);
+  for (;;) {
+    try {
+      linkSync(idPath, coordPath);
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST')
+        throw new DataError(`无法获取数据目录写入机会（认领回收协调文件失败）：${(e as Error).message}`);
+    }
+    // 已有协调者：仅当能确认其 pid 已退出时才回收；任何无法判定的情况一律等待。
+    let pid = -1;
+    try {
+      const m = /^(\d+)/.exec(readFileSync(coordPath, 'utf8'));
+      if (m !== null) pid = Number(m[1]);
+    } catch {
+      return false;
+    }
+    if (pid <= 0 || pidAlive(pid)) return false;
+    const trash = `${COORD_PREFIX}${process.pid}.${Math.random().toString(36).slice(2)}`;
+    try {
+      renameSync(coordPath, join(dir, trash)); // 与其他回收死协调者的进程原子决胜
+    } catch {
+      return false; // 他人已处理：下一轮由 link 的 EEXIST 判定新协调者
+    }
+    try { unlinkSync(join(dir, trash)); } catch { /* 忽略；后续 cleanStaleFiles 按死 pid 清理 */ }
+    // 循环回到 link 重试：只有一个进程能成功，其余看到新的存活协调者。
+  }
+}
+
+/** 列出各进程的锁身份文件名（仅 .stockroom.json.lock.<pid>.<nonce>，不含闸门/协调者）。 */
+function listLockIdentities(dir: string): string[] {
   let names: string[];
   try {
-    names = readdirSync(dataDir);
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names.filter((n) => lockNamePid(n) !== null);
+}
+
+/**
+ * 判断固定闸门是否属于已退出的写进程（可安全回收）。
+ * 优先按“与闸门同 inode 的身份文件名”中的 pid 判定（新协议，归属不依赖内容）；
+ * 没有匹配身份文件时（升级前的旧式单文件锁）回退读取闸门首行 pid，
+ * 内容无法解析则一律视为不可回收，绝不按文件年龄抢占存活进程。
+ * 返回 true 可回收；false 为存活占用或无法判定。
+ */
+function gateIsStale(dir: string): boolean {
+  const gatePath = join(dir, LOCK_GATE);
+  const coordStatPath = join(dir, LOCK_COORD);
+  let gateIno: number | bigint;
+  try {
+    gateIno = statSync(gatePath).ino;
+  } catch {
+    return false; // 闸门刚好被释放：调用方下一轮重试即可
+  }
+  for (const name of listLockIdentities(dir)) {
+    try {
+      if (statSync(join(dir, name)).ino === gateIno) return !pidAlive(lockNamePid(name)!);
+    } catch {
+      /* 身份文件刚被删除：忽略 */
+    }
+  }
+  // 经“无缝替换”取得闸门的持有者：其闸门 inode 同时由固定协调者文件承载，
+  // pid 记录在协调者内容里（身份文件原名已 rename 成闸门）。
+  try {
+    if (statSync(coordStatPath).ino === gateIno) {
+      const m = /^(\d+)/.exec(readFileSync(coordStatPath, 'utf8'));
+      if (m !== null) return !pidAlive(Number(m[1]));
+    }
+  } catch {
+    /* 协调者不存在或不可读：继续旧式回退判定 */
+  }
+  // 旧式单文件锁：仅当能读到明确且已退出的 pid 才回收
+  try {
+    const m = /^(\d+) /m.exec(readFileSync(gatePath, 'utf8'));
+    if (m === null) return false;
+    return !pidAlive(Number(m[1]));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 取得写入机会后清理异常退出写进程遗留的临时文件、孤立锁身份文件与各类回收物。
+ * 只有文件名中 pid 已退出的才删除；与现存闸门同 inode 的身份文件（当前占用
+ * 本身）绝不动，存活请求的文件与现任协调者文件一律不动。
+ */
+function cleanStaleFiles(dir: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
   } catch {
     return;
   }
+  let gateIno: number | bigint | undefined;
+  try {
+    gateIno = statSync(join(dir, LOCK_GATE)).ino;
+  } catch {
+    gateIno = undefined;
+  }
   for (const name of names) {
-    if (!name.startsWith(LOCK_TMP_PREFIX) || !name.endsWith('.tmp')) continue;
-    const pid = Number(name.slice(LOCK_TMP_PREFIX.length, -'.tmp'.length));
-    if (!Number.isInteger(pid) || pid <= 0 || pidAlive(pid)) continue;
+    let pidPart: number | null = null;
+    let isIdentity = false;
+    if (name.startsWith(TMP_PREFIX) && name.endsWith('.tmp')) {
+      const s = name.slice(TMP_PREFIX.length, -'.tmp'.length).split('.')[0];
+      if (/^\d+$/.test(s)) pidPart = Number(s);
+    } else if (name === LOCK_COORD) {
+      try { // 固定协调者文件：pid 记录在内容首行（内容写完后才 link 成此名）
+        const m = /^(\d+)/.exec(readFileSync(join(dir, name), 'utf8'));
+        if (m !== null) pidPart = Number(m[1]);
+      } catch { pidPart = null; }
+    } else if (name.startsWith(COORD_PREFIX)) {
+      const s = name.slice(COORD_PREFIX.length).split('.')[0]; // 死协调者回收物
+      if (/^\d+$/.test(s)) pidPart = Number(s);
+    } else if (name.startsWith(RECLAIM_PREFIX)) {
+      const s = name.slice(RECLAIM_PREFIX.length).split('.')[0]; // 死闸门回收物
+      if (/^\d+$/.test(s)) pidPart = Number(s);
+    } else {
+      pidPart = lockNamePid(name);
+      isIdentity = pidPart !== null;
+    }
+    if (pidPart === null || pidAlive(pidPart)) continue;
+    if (isIdentity && gateIno !== undefined) {
+      try {
+        if (statSync(join(dir, name)).ino === gateIno) continue; // 当前闸门本身：不清理
+      } catch {
+        /* 文件消失：继续尝试删除也无妨 */
+      }
+    }
     try {
-      unlinkSync(join(dataDir, name));
+      unlinkSync(join(dir, name));
     } catch {
       /* 清理失败不影响本次写入 */
     }
@@ -1219,67 +1422,182 @@ function cleanStaleTmpFiles(dataDir: string): void {
 }
 
 /**
- * 获取数据目录的写入机会（有限等待 + 异常退出自动恢复）。成功返回后调用方独占
- * 该目录的写权限，必须在 finally 中 release()；结束或失败都会释放占用。
+ * 获取数据目录的写入机会（固定闸门硬链接认领 + 稳定协调者无缝回收 + 异常退出恢复）。
+ * 成功返回后调用方独占该目录的写权限，必须在 finally 中 release()；
+ * 结束或失败都只释放本请求自己的锁。
  */
-function acquireWriteLock(dataDir: string): WriteLock {
-  const limit = lockWaitLimitMs();
-  const deadline = Date.now() + limit;
-  const path = join(dataDir, LOCK_FILENAME);
-  const content = `${process.pid} ${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}\n`;
+function acquireWriteLock(dataDirRaw: string): WriteLock {
+  const limit = lockWaitLimitMs(); // 非法配置在此即抛用法错误（退出 2），不进入等待
+  const dir = resolveDataDir(dataDirRaw);
   try {
-    mkdirSync(dataDir, { recursive: true }); // 首次使用：先建目录再竞争锁，并发创建同样安全
+    mkdirSync(dir, { recursive: true }); // 首次使用：先建目录再竞争锁，并发创建同样安全
   } catch (e) {
-    throw new DataError(`无法创建数据目录 ${dataDir}：${(e as Error).message}`);
+    throw new DataError(`无法创建数据目录 ${dataDirRaw}：${(e as Error).message}`);
   }
-  for (;;) {
+  const nonce = makeIdentity(dir); // O_EXCL 创建本进程身份文件，pid 在文件名中
+  return claimGate(dir, dataDirRaw, nonce, limit);
+}
+
+function makeIdentity(dir: string): string {
+  for (let tries = 0; tries < 3; tries++) {
+    const nonce = Math.random().toString(36).slice(2);
+    const idPath = join(dir, `${LOCK_PREFIX}${process.pid}.${nonce}`);
     try {
-      writeFileSync(path, content, { flag: 'wx' }); // 原子创建：已存在即失败
-      cleanStaleTmpFiles(dataDir);
-      let released = false;
-      return {
-        release(): void {
-          if (released) return;
-          released = true;
-          try {
-            // 仅当锁仍由本请求持有时删除，绝不错删其他写进程的锁
-            if (readFileSync(path, 'utf8') === content) unlinkSync(path);
-          } catch {
-            /* 锁已被接管或目录不可用：忽略 */
-          }
-        },
-      };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new DataError(`无法获取数据目录写入机会（创建锁文件失败）：${(e as Error).message}`);
-      }
-    }
-    const stale = staleLockContent(path);
-    if (stale !== null) {
-      // 写进程已异常退出：把遗留锁改名移走后重试。改名前重新比对原文，避免误移走
-      // 另一请求刚获得的新锁；改名竞争失败（他人已处理）时下一轮自然重试。
+      // 先写完整持有者信息再发布：身份文件的所有硬链接（闸门/协调者）被观察到时，
+      // 其内容与文件名都已完整；即使本进程随后暂停，存活 pid 也使其绝不被接管。
+      const fd = openSync(idPath, 'wx');
       try {
-        if (readFileSync(path, 'utf8') === stale) {
-          const trash = `${path}.stale.${process.pid}`;
-          try {
-            renameSync(path, trash);
-            unlinkSync(trash);
-          } catch {
-            /* 其他请求已处理该遗留锁 */
+        writeFileSync(fd, `${process.pid} ${new Date().toISOString()} ${nonce}\n`, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
+      return nonce;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST')
+        throw new DataError(`无法获取数据目录写入机会（创建锁身份文件失败）：${(e as Error).message}`);
+    }
+  }
+  throw new DataError('无法获取数据目录写入机会：锁身份文件反复创建冲突');
+}
+
+/**
+ * 用本进程的身份文件原子认领固定闸门。闸门被死进程遗留时，等待者先竞争唯一的
+ * “回收协调者”文件（硬链接原子认领，存活期间稳定唯一，崩溃则按死 pid 回收）：
+ *   - 只有协调者会动闸门，且只在 gateIsStale 确认死 pid 后动手；存活持有者的
+ *     闸门在其存在期间不会被任何等待者替换（非协调者只能等待）；
+ *   - 回收用一次原子“替换 rename”（rename(身份文件, 闸门)）无缝完成：闸门名
+ *     全程存在、inode 被整体换成新持有者，不存在“闸门短暂缺失被他人插队”的
+ *     空隙，因此回收者绝不可能移走另一个请求刚取得的闸门；
+ *   - 协调者在持有闸门期间一直保留协调者文件，与闸门一起释放；它在临界区
+ *     崩溃后，死协调者与死闸门（或回收物）由后续写入者凭死 pid 清理并接任，
+ *     多个恢复者依旧只能串行取得写入机会。
+ */
+function claimGate(dir: string, dataDirRaw: string, nonce: string, limit: number): WriteLock {
+  const idName = `${LOCK_PREFIX}${process.pid}.${nonce}`;
+  const idPath = join(dir, idName);
+  const gatePath = join(dir, LOCK_GATE);
+  const coordPath = join(dir, LOCK_COORD);
+  const deadline = Date.now() + limit;
+
+  const removeIdentity = (): void => {
+    try { unlinkSync(idPath); } catch { /* 已不存在（替换回收时身份原名已成为闸门）：忽略 */ }
+  };
+  // 让出/异常路径上释放协调者（仅当它仍是本进程身份文件的硬链接时）。
+  // 注意：只在“无缝替换 rename”尚未发生时调用，那时 idPath 必然仍存在。
+  const releaseCoordIfMine = (): void => {
+    try {
+      if (statSync(coordPath).ino === statSync(idPath).ino) unlinkSync(coordPath);
+    } catch { /* 已不存在：忽略 */ }
+  };
+
+  const finish = (heldCoord: boolean): WriteLock => {
+    cleanStaleFiles(dir); // 取得写入机会后清理已退出进程遗留的临时/身份/协调文件
+    // 经协调者无缝替换取得闸门后，身份文件原名已 rename 成闸门名，同 inode 的另一个
+    // 硬链接是协调者文件；直接 link 取得闸门时，同 inode 的另一个硬链接是身份文件。
+    const selfPath = heldCoord ? coordPath : idPath;
+    let released = false;
+    return {
+      release(): void {
+        if (released) return;
+        released = true;
+        let mine = false;
+        // 只在闸门仍指向本进程（同 inode）时删闸门，绝不删除他人占用。
+        try {
+          mine = statSync(gatePath).ino === statSync(selfPath).ino;
+          if (mine) unlinkSync(gatePath);
+        } catch {
+          mine = heldCoord; // 闸门已缺失：协调者路径仍可独立判断归属（见下）
+        }
+        removeIdentity(); // 替换回收时身份原名已不存在，删除被忽略
+        if (heldCoord) {
+          // 协调者文件是本进程身份的硬链接：闸门确认归属后即可安全删除；
+          // 若闸门已缺失，则仅当协调者文件记录的是本进程 pid 时才删。
+          if (mine) {
+            try { unlinkSync(coordPath); } catch { /* 忽略 */ }
+          } else {
+            try {
+              const m = /^(\d+)/.exec(readFileSync(coordPath, 'utf8'));
+              if (m !== null && Number(m[1]) === process.pid) unlinkSync(coordPath);
+            } catch { /* 忽略：遗留协调者由后续写入者凭死 pid 回收 */ }
           }
         }
-      } catch {
-        /* 锁已被释放或替换：直接重试 */
+      },
+    };
+  };
+
+  const busyError = (): DataError =>
+    new DataError(
+      `数据目录正忙：等待写入机会超过 ${limit} 毫秒仍未获得（另一进程正在写入 ${dataDirRaw}）；` +
+        `本次请求未做任何改动，请稍后重试`,
+    );
+
+  let amCoordinator = false; // 本进程是否已成为唯一回收协调者
+
+  for (;;) {
+    // 1) 原子认领固定闸门：闸门不存在时 link 成功即持有；存在时 EEXIST。
+    //    （前一持有者/协调者崩溃导致闸门缺失时，新请求由此直接取得。）
+    try {
+      linkSync(idPath, gatePath);
+      const heldCoord = amCoordinator;
+      amCoordinator = false;
+      return finish(heldCoord);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        if (amCoordinator) releaseCoordIfMine();
+        removeIdentity();
+        throw new DataError(`无法获取数据目录写入机会（认领锁闸门失败）：${(e as Error).message}`);
       }
-      continue;
     }
-    if (Date.now() >= deadline) {
-      throw new DataError(
-        `数据目录正忙：等待写入机会超过 ${limit} 毫秒仍未获得（另一进程正在写入 ${dataDir}）；` +
-          `本次请求未做任何改动，请稍后重试`,
-      );
+
+    // 2) 闸门被占且属已退出进程：竞争唯一回收协调者，只有协调者能回收闸门。
+    if (gateIsStale(dir)) {
+      if (!amCoordinator) amCoordinator = tryBecomeCoordinator(dir, idPath);
+      if (amCoordinator) {
+        // 成为协调者后再次确认陈旧（此间状态可能已变化）。
+        if (gateIsStale(dir)) {
+          // 无缝替换：原子把自己的身份文件 rename 到闸门名，旧死闸门被覆盖。
+          // 闸门名全程存在，无任何空隙可供他人插队。
+          try {
+            renameSync(idPath, gatePath);
+          } catch (e2) {
+            // 闸门刚好被释放（删除而非替换）：退回用 link 认领。
+            if ((e2 as NodeJS.ErrnoException).code !== 'ENOENT' && (e2 as NodeJS.ErrnoException).code !== 'EEXIST') {
+              releaseCoordIfMine();
+              removeIdentity();
+              throw new DataError(`无法获取数据目录写入机会（回收锁闸门失败）：${(e2 as Error).message}`);
+            }
+            try {
+              linkSync(idPath, gatePath);
+            } catch (e3) {
+              if ((e3 as NodeJS.ErrnoException).code === 'EEXIST') {
+                releaseCoordIfMine();
+                amCoordinator = false;
+                continue; // 已有新的存活持有者：让贤并等待
+              }
+              releaseCoordIfMine();
+              removeIdentity();
+              throw new DataError(`无法获取数据目录写入机会（认领锁闸门失败）：${(e3 as Error).message}`);
+            }
+          }
+          return finish(true); // 协调者身份随闸门持有到 release
+        }
+        // 闸门已不属死进程：释放协调者身份，回到普通等待。
+        releaseCoordIfMine();
+        amCoordinator = false;
+      }
+    } else if (amCoordinator) {
+      // 自己是协调者但闸门已被合法存活持有者占据：让贤。
+      releaseCoordIfMine();
+      amCoordinator = false;
     }
-    sleepSync(LOCK_POLL_MS);
+
+    // 3) 闸门属于存活进程（或等待现任协调者完成回收）：在等待上限内轮询。
+    if (limit === 0 || Date.now() >= deadline) {
+      if (amCoordinator) releaseCoordIfMine();
+      removeIdentity();
+      throw busyError();
+    }
+    sleepSync(COORD_POLL_MS);
   }
 }
 
@@ -3576,14 +3894,7 @@ function runRecon(rest: string[], store: Store): void {
 }
 
 function runReverse(rest: string[], dataDir: string, store: Store): void {
-  const args = parseArgs(rest, ['--orig']);
-  const revRaw = args.positionals[0];
-  if (revRaw === undefined || args.positionals.length !== 1)
-    throw new UsageError('用法：reverse <冲销单编号> --orig <原单编号>');
-  if (args.flags['--orig'] === undefined)
-    throw new UsageError('冲销必须通过 --orig <原单编号> 指定被冲销的原单');
-  const revId = trimOrThrow('冲销单编号', revRaw);
-  const origId = trimOrThrow('原单编号', args.flags['--orig']);
+  const { revId, origId } = parseReverseArgs(rest);
   const ledger = new Ledger(store);
   const outcome = ledger.applyReversal(revId, origId);
   ledger.commit(dataDir);
@@ -4590,12 +4901,10 @@ function runPoTransfer(rest: string[], dataDir: string, store: Store): void {
  * 全部重复时不改写数据。逐项输出编号、首次生效/重复（及重复来源）状态与提交结果。
  */
 function runImport(rest: string[], dataDir: string): void {
-  const args = parseArgs(rest, ['--file']);
-  const file = args.flags['--file'];
-  if (file === undefined || args.positionals.length > 0)
-    throw new UsageError('用法：import --file <单据列表 JSON 文件>');
+  const { file } = parseImportArgs(rest);
 
-  // 先完整读取并解析文件：文件不可读/解析失败时绝不触碰已提交状态
+  // 命令行参数已在等待前校验；取得写入机会后才读取并解析导入文件，
+  // 文件不可读/解析失败时绝不触碰已提交状态。
   const requests = parseImportFile(readImportFile(file));
 
   // 参数与文件格式均确认无误后才打开本地数据；损坏数据在此被拒绝且不报告成功
@@ -4717,10 +5026,17 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   空白后非空、区分大小写。
 
 多进程协调：
-  同一数据目录的写命令自动串行执行（目录内锁文件，取得写入机会后才读取最新
-  已提交状态；等待上限默认 10 秒，可用 STOCKROOM_LOCK_WAIT_MS 按毫秒调整，
-  超时报告“数据目录正忙”并退出 1）。写进程异常退出后由后续写请求自动恢复，
-  无需手工删除文件；只读查询不参与协调，不创建协调文件。
+  同一数据目录的写命令自动串行执行（目录内固定锁闸门与按进程命名的锁身份
+  文件；取得写入机会后才读取最新已提交状态，导入、方案执行与撤回为完整事务
+  不交错）。等待上限默认 10 秒，可用 STOCKROOM_LOCK_WAIT_MS 设置非负安全
+  整数毫秒（0 表示仅立即尝试；非法或超范围配置在等待前报标准错误退出 2，
+  不会变成无限等待），超时报告“数据目录正忙”并退出 1。缺少参数、未知选项
+  等用法错误也在等待前退出 2 且不创建协调文件。锁持有者仍存活时（即使其
+  持有者信息尚未写完）绝不被按文件年龄或内容接管；持有者异常退出后由后续
+  写请求凭进程号自动回收遗留锁与临时文件，多个等待者串行取得写入机会，回收
+  与释放都只作用于本请求自己的占用，无需手工删除文件；原子替换前崩溃不生效，
+  替换后完整提交保留，同号同内容重试只返回原结果。只读查询不参与协调，
+  不创建协调文件。
 
 采购与到货规则：
   po register 登记采购单（编号、供应商、收货仓及至少一种已登记商品的订购量），
@@ -4995,6 +5311,16 @@ function run(argv: string[]): void {
   }
 
   const tokens = rest.slice(1);
+  // 仅凭命令行即可判断的用法错误（缺参数、未知选项、错误的明细格式等）必须在
+  // 等待写入机会之前报出（退出 2），不创建任何协调文件；解析中顺带发现的业务
+  // 类错误（如调拨两仓相同、标识为空白）不抢在等待前抛出，仍由取得写入机会后
+  // 的同一套校验判定（退出 1）。库存、采购进度等需要读取已提交状态的业务校验
+  // 当然也在取得写入机会之后完成。
+  try {
+    validateCli(cmd, tokens);
+  } catch (e) {
+    if (e instanceof UsageError) throw e;
+  }
   // 写命令：先取得同一数据目录的写入机会，取得后才读取最新已提交状态，结束或
   // 失败都释放占用；只读命令不创建协调文件，直接读取当前已提交状态。
   const lock = isWriteCommand(cmd, tokens) ? acquireWriteLock(dataDir) : undefined;
@@ -5003,6 +5329,191 @@ function run(argv: string[]): void {
   } finally {
     lock?.release();
   }
+}
+
+/**
+ * 纯命令行校验：只检查“无需读取已提交状态”即可判定的用法错误（退出 2）。
+ * 涉及库存余量、采购进度、编号占用、快照等已提交状态的业务拒绝不在此判定，
+ * 仍由取得写入机会后的各命令处理（退出 1）。
+ */
+function validateCli(cmd: string, tokens: string[]): void {
+  switch (cmd) {
+    case 'in':
+    case 'out':
+    case 'transfer':
+      parseDocArgs(cmd, tokens);
+      return;
+    case 'count':
+      parseCountArgs(tokens);
+      return;
+    case 'reverse':
+      parseReverseArgs(tokens);
+      return;
+    case 'arrival':
+      parseArrivalArgs(tokens);
+      return;
+    case 'cancel':
+      parseCancelArgs(tokens);
+      return;
+    case 'return':
+      parseReturnArgs(tokens);
+      return;
+    case 'po-transfer':
+      parseTransferArgs(tokens);
+      return;
+    case 'import':
+      parseImportArgs(tokens);
+      return;
+    case 'product': {
+      const sub = tokens[0];
+      if (sub === 'add') {
+        const args = parseArgs(tokens.slice(1), []);
+        const [idRaw, nameRaw, ...extra] = args.positionals;
+        if (idRaw === undefined || nameRaw === undefined || extra.length > 0)
+          throw new UsageError('用法：product add <商品编号> <商品名称>');
+        trimOrThrow('商品编号', idRaw);
+        trimOrThrow('商品名称', nameRaw);
+      } else if (sub === 'list' || sub === 'ls') {
+        const args = parseArgs(tokens.slice(1), []);
+        if (args.positionals.length > 0) throw new UsageError('用法：product list');
+      } else {
+        throw new UsageError(sub === undefined ? '用法：product <add|list> …' : `未知 product 子命令：${sub}`);
+      }
+      return;
+    }
+    case 'po': {
+      const sub = tokens[0];
+      if (sub === 'register') {
+        parsePurchaseArgs(tokens.slice(1));
+      } else if (sub === 'show') {
+        const args = parseArgs(tokens.slice(1), []);
+        const [poRaw, ...extra] = args.positionals;
+        if (poRaw === undefined || extra.length > 0) throw new UsageError('用法：po show <采购编号>');
+        trimOrThrow('采购编号', poRaw);
+      } else if (sub === 'list' || sub === 'ls') {
+        const args = parseArgs(tokens.slice(1), []);
+        if (args.positionals.length > 0) throw new UsageError('用法：po list');
+      } else {
+        throw new UsageError(sub === undefined ? '用法：po <register|show|list> …' : `未知 po 子命令：${sub}`);
+      }
+      return;
+    }
+    case 'rule': {
+      const sub = tokens[0];
+      if (sub === 'set') {
+        const args = parseArgs(tokens.slice(1), ['--wh', '--min', '--target']);
+        const [pidRaw, ...extra] = args.positionals;
+        if (pidRaw === undefined || extra.length > 0)
+          throw new UsageError('用法：rule set <商品编号> --wh <仓库> --min <下限> --target <目标>');
+        if (args.flags['--wh'] === undefined) throw new UsageError('补货规则必须提供 --wh <仓库>');
+        if (args.flags['--min'] === undefined) throw new UsageError('补货规则必须提供 --min <下限>');
+        if (args.flags['--target'] === undefined) throw new UsageError('补货规则必须提供 --target <目标>');
+        trimOrThrow('商品编号', pidRaw);
+        trimOrThrow('仓库标识', args.flags['--wh']);
+        parseNonNegInt('下限', args.flags['--min']);
+        parseNonNegInt('目标', args.flags['--target']);
+      } else if (sub === 'list' || sub === 'ls') {
+        const args = parseArgs(tokens.slice(1), []);
+        if (args.positionals.length > 0) throw new UsageError('用法：rule list');
+      } else if (sub === 'delete' || sub === 'del') {
+        const args = parseArgs(tokens.slice(1), ['--wh']);
+        const [pidRaw, ...extra] = args.positionals;
+        if (pidRaw === undefined || extra.length > 0)
+          throw new UsageError('用法：rule delete <商品编号> --wh <仓库>');
+        if (args.flags['--wh'] === undefined) throw new UsageError('删除补货规则必须提供 --wh <仓库>');
+        trimOrThrow('商品编号', pidRaw);
+        trimOrThrow('仓库标识', args.flags['--wh']);
+      } else {
+        throw new UsageError(sub === undefined ? '用法：rule <set|list|delete> …' : `未知 rule 子命令：${sub}`);
+      }
+      return;
+    }
+    case 'plan': {
+      const sub = tokens[0];
+      if (sub === 'save') {
+        parsePlanSaveArgs(tokens.slice(1));
+      } else if (sub === 'execute' || sub === 'exec') {
+        const args = parseArgs(tokens.slice(1), []);
+        const [planRaw, ...extra] = args.positionals;
+        if (planRaw === undefined || extra.length > 0) throw new UsageError('用法：plan execute <方案编号>');
+        trimOrThrow('方案编号', planRaw);
+      } else if (sub === 'withdraw') {
+        parsePlanWithdrawArgs(tokens.slice(1));
+      } else if (sub === 'show') {
+        const args = parseArgs(tokens.slice(1), []);
+        const [planRaw, ...extra] = args.positionals;
+        if (planRaw === undefined || extra.length > 0) throw new UsageError('用法：plan show <方案编号>');
+        trimOrThrow('方案编号', planRaw);
+      } else if (sub === 'list' || sub === 'ls') {
+        const args = parseArgs(tokens.slice(1), []);
+        if (args.positionals.length > 0) throw new UsageError('用法：plan list');
+      } else {
+        throw new UsageError(
+          sub === undefined ? '用法：plan <save|show|list|execute|withdraw> …' : `未知 plan 子命令：${sub}`,
+        );
+      }
+      return;
+    }
+    case 'balance': {
+      const args = parseArgs(tokens, ['--wh']);
+      const [pidRaw, ...extra] = args.positionals;
+      if (pidRaw === undefined || extra.length > 0)
+        throw new UsageError('用法：balance <商品编号> [--wh <仓库>]');
+      trimOrThrow('商品编号', pidRaw);
+      if (args.flags['--wh'] !== undefined) trimOrThrow('仓库标识', args.flags['--wh']);
+      return;
+    }
+    case 'flow': {
+      const args = parseArgs(tokens, ['--product', '--wh']);
+      if (args.positionals.length > 0)
+        throw new UsageError('用法：flow (--product <商品编号> | --wh <仓库>)…');
+      if (args.flags['--product'] === undefined && args.flags['--wh'] === undefined)
+        throw new UsageError('flow 至少需要一个过滤条件：--product <商品编号> 和/或 --wh <仓库>');
+      if (args.flags['--product'] !== undefined) trimOrThrow('商品编号', args.flags['--product']);
+      if (args.flags['--wh'] !== undefined) trimOrThrow('仓库标识', args.flags['--wh']);
+      return;
+    }
+    case 'recon': {
+      const args = parseArgs(tokens, ['--from', '--to', '--product', '--wh']);
+      if (args.positionals.length > 0)
+        throw new UsageError(
+          '用法：recon [--from <起点单据编号>] [--to <终点单据编号>] [--product <商品编号>] [--wh <仓库>]',
+        );
+      for (const [k, label] of [['--from', '起点单据编号'], ['--to', '终点单据编号'], ['--product', '商品编号'], ['--wh', '仓库标识']] as const) {
+        if (args.flags[k] !== undefined) trimOrThrow(label, args.flags[k]);
+      }
+      return;
+    }
+    case 'replenish': {
+      const args = parseArgs(tokens, []);
+      if (args.positionals.length > 0) throw new UsageError('用法：replenish');
+      return;
+    }
+    default:
+      throw new UsageError(`未知命令：${cmd}（使用 --help 查看可用命令）`);
+  }
+}
+
+/** reverse 的纯命令行解析（抽出以便等待前校验复用）。 */
+function parseReverseArgs(tokens: string[]): { revId: string; origId: string } {
+  const args = parseArgs(tokens, ['--orig']);
+  const revRaw = args.positionals[0];
+  if (revRaw === undefined || args.positionals.length !== 1)
+    throw new UsageError('用法：reverse <冲销单编号> --orig <原单编号>');
+  if (args.flags['--orig'] === undefined)
+    throw new UsageError('冲销必须通过 --orig <原单编号> 指定被冲销的原单');
+  return {
+    revId: trimOrThrow('冲销单编号', revRaw),
+    origId: trimOrThrow('原单编号', args.flags['--orig']),
+  };
+}
+
+/** import 的纯命令行解析；导入文件内容本身在取得写入机会后才读取与解析。 */
+function parseImportArgs(tokens: string[]): { file: string } {
+  const args = parseArgs(tokens, ['--file']);
+  if (args.flags['--file'] === undefined || args.positionals.length > 0)
+    throw new UsageError('用法：import --file <单据列表 JSON 文件>');
+  return { file: args.flags['--file'] };
 }
 
 function dispatch(cmd: string, tokens: string[], dataDir: string): void {
