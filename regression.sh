@@ -1,5 +1,5 @@
 #!/bin/sh
-# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议。
+# stockroom 本地回归检查：精度边界、取消与冲销、采购待收转单与转单冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -538,6 +538,188 @@ if [ $code -ne 1 ]; then
 else
   check "末笔余量与当前实存不一致拒报" "末笔流水 #1 余量 5 与当前实存 3 不一致" "$out"
 fi
+
+echo "== 11. 采购待收转单与转单冲销 =="
+D12="$TMP/data12"
+run12() { node "$APP" -d "$D12" "$@"; }
+check_refuse12() { # check_refuse12 <描述> <期望错误文本> <命令...>（在 D12 数据目录下）
+  desc=$1; want=$2; shift 2
+  out=$(run12 "$@" 2>&1); code=$?
+  if [ $code -ne 1 ]; then
+    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+  else
+    check "$desc" "$want" "$out"
+  fi
+}
+run12 product add P1 螺丝 >/dev/null
+run12 product add P2 螺母 >/dev/null
+run12 po register PO1 --supplier S1 --wh W1 --item P1:10 --item P2:5 >/dev/null
+run12 arrival A1 --po PO1 --item P1:4 >/dev/null
+run12 cancel X1 --po PO1 --item P2:1 >/dev/null
+# 基本转单：P1 待到货 6 转 3；P2 待到货 4 转 2（同商品 1+1 先合并）
+out=$(run12 potransfer PT1 --from PO1 --to PO2 --supplier S2 --wh W2 --item P1:3 --item P2:1 --item P2:1)
+check "转单成功首行（含两单与目的供应商/收货仓）" \
+  "转单 PT1 提交成功，原采购单 PO1 -> 目的采购单 PO2（供应商 S2，收货仓 W2），共 2 种商品" "$out"
+check "转单逐商品说明两单前后待收（P1）" \
+  "转出 P1 x3：原采购单 PO1 待到货 6 -> 3；目的采购单 PO2 待到货 0 -> 3" "$out"
+check "转单同商品先合并（P2 1+1=2）" \
+  "转出 P2 x2：原采购单 PO1 待到货 4 -> 2；目的采购单 PO2 待到货 0 -> 2" "$out"
+out=$(run12 balance P1 --wh W1)
+check "转单不改库存" "余量：商品 P1 仓库 W1 = 4" "$out"
+out=$(run12 flow --product P1)
+check "转单不产生库存流水" "共 1 条" "$out"
+out=$(run12 po show PO1)
+check "原单有效取消含转出量（不误报收齐）" "P1	10	4	3	3	部分到货（仍待收）" "$out"
+check "原单展示转单关联" "转单 PT1（有效）：转出至目的采购单 PO2（供应商 S2，收货仓 W2）" "$out"
+out=$(run12 po show PO2)
+check "目的单订购量等于转出量" "P1	3	0	0	3	未到货" "$out"
+check "目的单展示转入关联" "转单 PT1（有效）：自原采购单 PO1 转入" "$out"
+# 幂等与编号规则
+out=$(run12 potransfer PT1 --from PO1 --to PO2 --supplier S2 --wh W2 --item P2:2 --item P1:3)
+check "同号同全部内容重放返回原结果（顺序无关）" "转单 PT1 为重复提交" "$out"
+check_refuse12 "同号改内容拒绝" "已用于内容不同的单据" \
+  potransfer PT1 --from PO1 --to PO2 --supplier S2 --wh W2 --item P1:4
+check_refuse12 "目的编号已被采购占用即拒绝（即使内容相同）" "已被采购单占用" \
+  potransfer PT2 --from PO1 --to PO2 --supplier S2 --wh W2 --item P1:1
+check_refuse12 "超转出整单拒绝" "待到货 3，本次转出 4，拒绝整单" \
+  potransfer PT3 --from PO1 --to PO9 --supplier S3 --wh W3 --item P1:4
+check_refuse12 "原采购单不存在拒绝" "原采购单 NOPE 不存在" \
+  potransfer PT4 --from NOPE --to PO8 --supplier S3 --wh W3 --item P1:1
+check_refuse12 "商品不在原单内拒绝" "不在原采购单 PO1 的订购明细内" \
+  potransfer PT5 --from PO1 --to PO8 --supplier S3 --wh W3 --item P3:1
+out=$(run12 potransfer PT3 --from PO1 --to PO9 --supplier S3 --wh W3 --item P1:2)
+check "失败不占转单编号，可重试成功" "转单 PT3 提交成功" "$out"
+check_refuse12 "转单编号与到货单冲突" "已用于到货单" \
+  potransfer A1 --from PO1 --to PO7 --supplier S --wh W --item P1:1
+check_refuse12 "到货单编号与转单冲突" "已用于转单" arrival PT3 --po PO1 --item P1:1
+out=$(run12 potransfer 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - potransfer 缺参数退出码应为 2，实际 $code"; FAIL=1; }
+# 目的单可按普通采购到货、取消、再转单
+run12 arrival A2 --po PO2 --item P1:1 >/dev/null
+run12 cancel X2 --po PO2 --item P2:1 >/dev/null
+out=$(run12 potransfer PT6 --from PO2 --to PO6 --supplier S6 --wh W6 --item P1:1)
+check "目的单可再转单" "转单 PT6 提交成功，原采购单 PO2 -> 目的采购单 PO6" "$out"
+check_refuse12 "目的单未全量待收禁止冲销转单" "未保持全量待收" reverse R1 --orig PT1
+# 历史业务合法恢复全量待收后可冲销：先冲销目的单的到货、取消与再转单
+run12 reverse RV2 --orig A2 >/dev/null
+run12 reverse RV3 --orig X2 >/dev/null
+run12 reverse RV4 --orig PT6 >/dev/null
+out=$(run12 reverse R1 --orig PT1)
+check "恢复全量待收后可冲销转单" "冲销单 R1 提交成功，冲销转单原单 PT1（原采购单 PO1，目的采购单 PO2）" "$out"
+check "冲销转单恢复原单待收" "原采购单 PO1 待到货 1 -> 4（移除本转单的有效取消）" "$out"
+check "冲销转单目的单全部计为取消" "目的采购单 PO2 订购 3 全部计为取消，待到货 3 -> 0" "$out"
+out=$(run12 po show PO1)
+check "冲销后原单待收恢复（P1 待到货 4）" "P1	10	4	2	4	部分到货（仍待收）" "$out"
+out=$(run12 po show PO2)
+check "冲销后目的单结清不误报收齐" "P1	3	0	3	0	已结清（含取消）" "$out"
+check "目的单展示转单冲销关联" "转单 PT1（已由冲销单 R1 整单冲销" "$out"
+check_refuse12 "转单冲销后目的单不可再到货" "待到货 0，本次 1，拒绝整单" arrival A9 --po PO2 --item P1:1
+check_refuse12 "转单冲销后目的单不可再取消" "待到货 0，本次取消 1，拒绝整单" cancel X9 --po PO2 --item P1:1
+check_refuse12 "转单冲销后目的单不可再转出" "待到货 0，本次转出 1，拒绝整单" \
+  potransfer PT8 --from PO2 --to PO8 --supplier S --wh W --item P1:1
+# 冲销幂等与限制
+out=$(run12 reverse R1 --orig PT1)
+check "成功冲销同号同原单重放返回原结果" "冲销单 R1 为重复提交" "$out"
+check_refuse12 "每张转单最多冲销一次" "每张转单只能冲销一次" reverse R7 --orig PT1
+check_refuse12 "同冲销编号改指其他原单拒绝" "不能改冲原单 A1" reverse R1 --orig A1
+check_refuse12 "冲销单不可冲销" "冲销单不可冲销" reverse R8 --orig R1
+out=$(run12 potransfer PT1 --from PO1 --to PO2 --supplier S2 --wh W2 --item P1:3 --item P2:2)
+check "已冲销转单同号同内容重放仍只返回原结果" "转单 PT1 为重复提交" "$out"
+# 补货建议按含转单的净进度计算（PO9 收货仓 W3 待到货 2；PO1 收货仓 W1 待到货 4）
+run12 rule set P1 --wh W1 --min 3 --target 9 >/dev/null
+run12 rule set P1 --wh W3 --min 5 --target 10 >/dev/null
+out=$(run12 replenish)
+check "补货待到货合计含转单净进度（W1）" "商品 P1 仓库 W1：下限 3，目标 9，实存 4，待到货合计 4，预计量 8，未触发" "$out"
+check "补货待到货合计含转单净进度（W3）" "商品 P1 仓库 W3：下限 5，目标 10，实存 0，待到货合计 2，预计量 2，触发补货，缺口 8" "$out"
+# 转单及其冲销无库存流水，不能用作对账期间边界
+check_refuse12 "只有转单记录的编号不可用作边界" "只有转单记录，没有库存流水" recon --from PT3
+check_refuse12 "冲销转单的冲销单不可用作边界" "是冲销转单的冲销单，没有库存流水" recon --to R1
+# 有序导入：转单及冲销，后项使用前项状态
+cat > "$TMP/batch-pt.json" <<'EOF'
+[
+  {"type":"po","id":"POI1","supplier":"SI","wh":"W1","items":[{"product":"P1","qty":8}]},
+  {"type":"potransfer","id":"PTI1","from":"POI1","to":"POI2","supplier":"SI2","wh":"W2","items":[{"product":"P1","qty":3}]},
+  {"type":"reverse","id":"RI1","orig":"PTI1"}
+]
+EOF
+out=$(run12 import --file "$TMP/batch-pt.json")
+check "导入转单及冲销成功" "首次生效 3 项" "$out"
+out=$(run12 po show POI1)
+check "导入冲销转单后原单待收恢复" "P1	8	0	0	8	未到货" "$out"
+out=$(run12 import --file "$TMP/batch-pt.json")
+check "全部重复不改写数据" "首次生效 0 项，重复 3 项" "$out"
+# 批量回滚：第二项超转出，整批拒绝且本批目的采购不保留
+cat > "$TMP/batch-pt-bad.json" <<'EOF'
+[
+  {"type":"potransfer","id":"PTI2","from":"POI1","to":"POI3","supplier":"S","wh":"W1","items":[{"product":"P1","qty":5}]},
+  {"type":"potransfer","id":"PTI3","from":"POI1","to":"POI4","supplier":"S","wh":"W1","items":[{"product":"P1","qty":9}]}
+]
+EOF
+out=$(run12 import --file "$TMP/batch-pt-bad.json" 2>&1); code=$?
+[ $code -eq 1 ] || { echo "FAIL - 转单批量拒绝退出码应为 1，实际 $code"; FAIL=1; }
+check "批量拒绝指出位置" "第 2 项" "$out"
+check "批量拒绝说明超转出原因" "转出量超出原采购单待到货量" "$out"
+out=$(run12 po show POI3 2>&1)
+check "批内前项目的采购不保留" "采购单 POI3 不存在" "$out"
+out=$(run12 potransfer PTI2 --from POI1 --to POI3 --supplier S --wh W1 --item P1:5)
+check "批量失败后新编号可复用" "转单 PTI2 提交成功" "$out"
+# 损坏数据拒读：目的采购不存在、内容不一致、负待到货（转出量超订购）
+BAD12="$TMP/bad12"
+mkdir -p "$BAD12"
+cat > "$BAD12/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W","ordered":{"P9":5},"resultLines":[]}},
+ "arrivals":{},"cancels":{},"returns":{},
+ "poTransfers":{"PT9":{"fromPo":"PO9","toPo":"POX","supplier":"S2","wh":"W2","qty":{"P9":3},"resultLines":[]}}}
+EOF
+out=$(node "$APP" -d "$BAD12" po list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 目的采购不存在应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "损坏转单（目的采购不存在）拒读" "转单 PT9 指向的目的采购单 POX 不存在" "$out"
+fi
+cat > "$BAD12/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W","ordered":{"P9":5},"resultLines":[]},
+              "POX":{"poId":"POX","supplier":"S2","wh":"W2","ordered":{"P9":2},"resultLines":[]}},
+ "arrivals":{},"cancels":{},"returns":{},
+ "poTransfers":{"PT9":{"fromPo":"PO9","toPo":"POX","supplier":"S2","wh":"W2","qty":{"P9":3},"resultLines":[]}}}
+EOF
+out=$(node "$APP" -d "$BAD12" po list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 目的采购内容不一致应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "损坏转单（目的采购内容不一致）拒读" "与目的采购单 POX 的供应商、收货仓或订购量不一致" "$out"
+fi
+cat > "$BAD12/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W","ordered":{"P9":5},"resultLines":[]},
+              "POX":{"poId":"POX","supplier":"S2","wh":"W2","ordered":{"P9":6},"resultLines":[]}},
+ "arrivals":{},"cancels":{},"returns":{},
+ "poTransfers":{"PT9":{"fromPo":"PO9","toPo":"POX","supplier":"S2","wh":"W2","qty":{"P9":6},"resultLines":[]}}}
+EOF
+out=$(node "$APP" -d "$BAD12" po list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 转出量超订购（负待到货）应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "损坏转单（负待到货）拒读" "待到货量为负" "$out"
+fi
+# 旧数据无 poTransfers 字段直接可用并保留历史结果
+cat > "$BAD12/stockroom.json" <<'EOF'
+{"version":1,"products":{"P9":"x"},"stock":{"P9":{"W":3}},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W","ordered":{"P9":5},"resultLines":[]}},
+ "arrivals":{},"cancels":{},"returns":{}}
+EOF
+out=$(node "$APP" -d "$BAD12" po show PO9)
+check "旧数据无 poTransfers 字段按无转单处理" "P9	5	0	5	未到货" "$out"
+# 特殊标识：__proto__ 与含冒号编号可正常转单
+D13="$TMP/data13"
+node "$APP" -d "$D13" product add __proto__ 特殊件 >/dev/null
+node "$APP" -d "$D13" po register 'PO:1' --supplier S --wh W1 --item __proto__:5 >/dev/null
+out=$(node "$APP" -d "$D13" potransfer '__proto__' --from 'PO:1' --to 'PO:2' --supplier 'S:2' --wh 'W:2' --item __proto__:2)
+check "__proto__ 与含冒号标识可正常转单" "转单 __proto__ 提交成功，原采购单 PO:1 -> 目的采购单 PO:2" "$out"
+out=$(node "$APP" -d "$D13" reverse 'R:1' --orig '__proto__')
+check "特殊标识转单可冲销" "冲销单 R:1 提交成功，冲销转单原单 __proto__" "$out"
 
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
