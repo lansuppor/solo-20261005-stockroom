@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // stockroom —— 本地多仓库存台账（Node.js 24，TypeScript，无外部运行依赖）
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const APP_NAME = 'stockroom';
@@ -1131,6 +1131,155 @@ function saveStore(dataDir: string, store: Store): void {
     renameSync(tmp, path);
   } catch (e) {
     throw new DataError(`保存数据失败，已有数据保持不变：${(e as Error).message}`);
+  }
+}
+
+// ---------- 多进程写入协调 ----------
+//
+// 同一数据目录的写请求用目录内的锁文件串行化：取得写入机会后才读取最新已提交
+// 状态，业务校验、去重与原子保存（临时文件 + rename）都在持有锁期间完成，因此
+// 并发请求的最终结果等价于某个完整串行执行顺序，流水序号与该顺序一致。锁文件
+// 位于数据目录内部，相对、绝对及符号链接路径指向同一目录时自然共用同一把锁；
+// 不同目录各有自己的锁，互不阻塞。只读查询不创建也不检查锁文件。
+//
+// 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按毫秒调整），
+// 超时明确报错并以退出码 1 结束。写进程异常退出（如被 kill）会留下锁文件：
+// 后续写请求发现锁中记录的进程号已不存在时自动接管，无需手工删除任何文件；
+// 仍存活的写进程无论写多久都不会被抢占。
+
+const LOCK_FILENAME = `.${DATA_FILENAME}.lock`;
+const LOCK_TMP_PREFIX = `.${DATA_FILENAME}.`;
+const LOCK_WAIT_DEFAULT_MS = 10_000;
+const LOCK_POLL_MS = 50;
+const LOCK_UNREADABLE_FRESH_MS = 2_000; // 内容尚未写入的锁在此宽限内视为“刚创建”，不抢占
+
+interface WriteLock {
+  release(): void;
+}
+
+function lockWaitLimitMs(): number {
+  const raw = process.env.STOCKROOM_LOCK_WAIT_MS;
+  if (raw !== undefined && /^\d+$/.test(raw)) return Number(raw);
+  return LOCK_WAIT_DEFAULT_MS;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'; // 存在但无权发信号：视为存活
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * 读取现存锁文件并判断是否属于已退出的写进程：返回锁文件原文表示可安全接管；
+ * 返回 null 表示锁被存活进程持有（或刚好被释放/替换，下一轮重试即可）。
+ * 内容尚不可解析的锁视为“刚创建、内容未写完”，短暂宽限内不抢占，超过宽限按
+ * 异常遗留处理。
+ */
+function staleLockContent(path: string): string | null {
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+  const m = /^(\d+) /.exec(content);
+  if (m !== null) return pidAlive(Number(m[1])) ? null : content;
+  try {
+    return Date.now() - statSync(path).mtimeMs > LOCK_UNREADABLE_FRESH_MS ? content : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 清理异常退出写进程遗留的临时文件；其他存活写入的临时文件一律不动。 */
+function cleanStaleTmpFiles(dataDir: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(dataDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(LOCK_TMP_PREFIX) || !name.endsWith('.tmp')) continue;
+    const pid = Number(name.slice(LOCK_TMP_PREFIX.length, -'.tmp'.length));
+    if (!Number.isInteger(pid) || pid <= 0 || pidAlive(pid)) continue;
+    try {
+      unlinkSync(join(dataDir, name));
+    } catch {
+      /* 清理失败不影响本次写入 */
+    }
+  }
+}
+
+/**
+ * 获取数据目录的写入机会（有限等待 + 异常退出自动恢复）。成功返回后调用方独占
+ * 该目录的写权限，必须在 finally 中 release()；结束或失败都会释放占用。
+ */
+function acquireWriteLock(dataDir: string): WriteLock {
+  const limit = lockWaitLimitMs();
+  const deadline = Date.now() + limit;
+  const path = join(dataDir, LOCK_FILENAME);
+  const content = `${process.pid} ${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}\n`;
+  try {
+    mkdirSync(dataDir, { recursive: true }); // 首次使用：先建目录再竞争锁，并发创建同样安全
+  } catch (e) {
+    throw new DataError(`无法创建数据目录 ${dataDir}：${(e as Error).message}`);
+  }
+  for (;;) {
+    try {
+      writeFileSync(path, content, { flag: 'wx' }); // 原子创建：已存在即失败
+      cleanStaleTmpFiles(dataDir);
+      let released = false;
+      return {
+        release(): void {
+          if (released) return;
+          released = true;
+          try {
+            // 仅当锁仍由本请求持有时删除，绝不错删其他写进程的锁
+            if (readFileSync(path, 'utf8') === content) unlinkSync(path);
+          } catch {
+            /* 锁已被接管或目录不可用：忽略 */
+          }
+        },
+      };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new DataError(`无法获取数据目录写入机会（创建锁文件失败）：${(e as Error).message}`);
+      }
+    }
+    const stale = staleLockContent(path);
+    if (stale !== null) {
+      // 写进程已异常退出：把遗留锁改名移走后重试。改名前重新比对原文，避免误移走
+      // 另一请求刚获得的新锁；改名竞争失败（他人已处理）时下一轮自然重试。
+      try {
+        if (readFileSync(path, 'utf8') === stale) {
+          const trash = `${path}.stale.${process.pid}`;
+          try {
+            renameSync(path, trash);
+            unlinkSync(trash);
+          } catch {
+            /* 其他请求已处理该遗留锁 */
+          }
+        }
+      } catch {
+        /* 锁已被释放或替换：直接重试 */
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new DataError(
+        `数据目录正忙：等待写入机会超过 ${limit} 毫秒仍未获得（另一进程正在写入 ${dataDir}）；` +
+          `本次请求未做任何改动，请稍后重试`,
+      );
+    }
+    sleepSync(LOCK_POLL_MS);
   }
 }
 
@@ -4567,6 +4716,12 @@ const HELP = `${APP_NAME} —— 本地多仓库存台账
   单据编号空间，允许与库存/到货/取消/退货/转单/冲销单同名。所有标识与名称去首尾
   空白后非空、区分大小写。
 
+多进程协调：
+  同一数据目录的写命令自动串行执行（目录内锁文件，取得写入机会后才读取最新
+  已提交状态；等待上限默认 10 秒，可用 STOCKROOM_LOCK_WAIT_MS 按毫秒调整，
+  超时报告“数据目录正忙”并退出 1）。写进程异常退出后由后续写请求自动恢复，
+  无需手工删除文件；只读查询不参与协调，不创建协调文件。
+
 采购与到货规则：
   po register 登记采购单（编号、供应商、收货仓及至少一种已登记商品的订购量），
   登记只记录订购信息、绝不改动库存，成功后内容不可修改；同号同内容重放返回原
@@ -4784,6 +4939,35 @@ function printHelp(): void {
   console.log(HELP);
 }
 
+/** 可能改变数据的命令（须先取得写入机会）；其余为只读查询，不创建协调文件。 */
+function isWriteCommand(cmd: string, tokens: string[]): boolean {
+  switch (cmd) {
+    case 'in':
+    case 'out':
+    case 'transfer':
+    case 'count':
+    case 'reverse':
+    case 'arrival':
+    case 'cancel':
+    case 'return':
+    case 'po-transfer':
+    case 'import':
+      return true;
+    case 'product':
+      return tokens[0] === 'add';
+    case 'po':
+      return tokens[0] === 'register';
+    case 'rule':
+      return tokens[0] === 'set' || tokens[0] === 'delete' || tokens[0] === 'del';
+    case 'plan':
+      return (
+        tokens[0] === 'save' || tokens[0] === 'execute' || tokens[0] === 'exec' || tokens[0] === 'withdraw'
+      );
+    default:
+      return false;
+  }
+}
+
 function run(argv: string[]): void {
   // 先抽出全局 -d/--data，其余按命令解析
   let dataDir = DEFAULT_DATA_DIR;
@@ -4811,6 +4995,17 @@ function run(argv: string[]): void {
   }
 
   const tokens = rest.slice(1);
+  // 写命令：先取得同一数据目录的写入机会，取得后才读取最新已提交状态，结束或
+  // 失败都释放占用；只读命令不创建协调文件，直接读取当前已提交状态。
+  const lock = isWriteCommand(cmd, tokens) ? acquireWriteLock(dataDir) : undefined;
+  try {
+    dispatch(cmd, tokens, dataDir);
+  } finally {
+    lock?.release();
+  }
+}
+
+function dispatch(cmd: string, tokens: string[], dataDir: string): void {
   switch (cmd) {
     case 'product': {
       const store = loadStore(dataDir);

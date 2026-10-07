@@ -1,6 +1,6 @@
 #!/bin/sh
 # stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议、
-# 补货方案保存/执行/整案撤回、期间库存对账报表、采购待收转单。
+# 补货方案保存/执行/整案撤回、期间库存对账报表、采购待收转单、多进程写入协调。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -887,6 +887,166 @@ out=$(run13 plan withdraw W9 2>&1); code=$?
 [ $code -eq 2 ] || { echo "FAIL - plan withdraw 缺 --plan 退出码应为 2，实际 $code"; FAIL=1; }
 out=$(run13 plan withdraw W9 --plan PL1 --transfer-rev T1 2>&1); code=$?
 [ $code -eq 2 ] || { echo "FAIL - 映射格式错误退出码应为 2，实际 $code"; FAIL=1; }
+
+echo "== 13. 多进程写入协调：并行竞争、超时、异常退出恢复与重放 =="
+export STOCKROOM_LOCK_WAIT_MS=30000   # 并行用例给足等待上限；超时用例再单独调小
+D20="$TMP/data20"
+node "$APP" -d "$D20" product add P1 螺丝 >/dev/null
+# 并行合法入库：不丢单、不丢数量
+i=1
+while [ $i -le 8 ]; do
+  node "$APP" -d "$D20" in "PI$i" --wh W1 --item P1:1 >/dev/null 2>&1 &
+  i=$((i+1))
+done
+wait
+out=$(node "$APP" -d "$D20" balance P1 --wh W1)
+check "8 进程并行入库不丢单不丢数量" "余量：商品 P1 仓库 W1 = 8" "$out"
+# 竞争有限库存的出库：8 进程抢 5 件，不能共同超量成功
+node "$APP" -d "$D20" in PI9 --wh W2 --item P1:5 >/dev/null
+: > "$TMP/race-out.res"
+i=1
+while [ $i -le 8 ]; do
+  ( node "$APP" -d "$D20" out "PO$i" --wh W2 --item P1:1 >/dev/null 2>&1; echo $? ) >> "$TMP/race-out.res" &
+  i=$((i+1))
+done
+wait
+nok=$(grep -c '^0$' "$TMP/race-out.res")
+nfail=$(grep -c '^1$' "$TMP/race-out.res")
+if [ "$nok" -eq 5 ] && [ "$nfail" -eq 3 ]; then
+  echo "ok   - 竞争有限库存的出库不超量成功（8 进程抢 5 件：5 成 3 拒）"
+else
+  echo "FAIL - 竞争出库结果异常（成功 $nok、拒绝 $nfail，应为 5 成 3 拒）"; FAIL=1
+fi
+out=$(node "$APP" -d "$D20" balance P1 --wh W2)
+check "竞争出库后余量精确为 0" "余量：商品 P1 仓库 W2 = 0" "$out"
+# 业务拒绝后锁已释放，后续写入立即可用
+node "$APP" -d "$D20" out FAIL1 --wh W1 --item P1:999 >/dev/null 2>&1
+out=$(node "$APP" -d "$D20" in AFTER1 --wh W1 --item P1:1)
+check "业务拒绝后后续写入立即可用" "入库单 AFTER1 提交成功" "$out"
+# 并行同编号同内容：只生效一次，其余返回原结果（双方都成功退出）
+: > "$TMP/race-dup.res"
+( node "$APP" -d "$D20" in DUP1 --wh W3 --item P1:7 >/dev/null 2>&1; echo $? ) >> "$TMP/race-dup.res" &
+( node "$APP" -d "$D20" in DUP1 --wh W3 --item P1:7 >/dev/null 2>&1; echo $? ) >> "$TMP/race-dup.res" &
+wait
+out=$(node "$APP" -d "$D20" balance P1 --wh W3)
+check "并行同编号同内容只生效一次" "余量：商品 P1 仓库 W3 = 7" "$out"
+nok=$(grep -c '^0$' "$TMP/race-dup.res")
+[ "$nok" -eq 2 ] && echo "ok   - 同内容重放方也成功返回原结果" || { echo "FAIL - 同内容并行重放应都成功（成功数 $nok）"; FAIL=1; }
+# 并行同号不同内容：依编号空间拒绝，仅一个成功
+: > "$TMP/race-conf.res"
+( node "$APP" -d "$D20" in DUP2 --wh W3 --item P1:1 >/dev/null 2>&1; echo $? ) >> "$TMP/race-conf.res" &
+( node "$APP" -d "$D20" in DUP2 --wh W3 --item P1:2 >/dev/null 2>&1; echo $? ) >> "$TMP/race-conf.res" &
+wait
+codes=$(sort "$TMP/race-conf.res" | tr -d '\n')
+[ "$codes" = "01" ] && echo "ok   - 并行同号不同内容仅一个成功、另一个拒绝" || { echo "FAIL - 同号冲突退出码异常：$codes"; FAIL=1; }
+out=$(node "$APP" -d "$D20" balance P1 --wh W3)
+case $out in
+  *"= 8"|*"= 9") echo "ok   - 同号冲突后只有一份内容生效" ;;
+  *) echo "FAIL - 同号冲突后库存异常：$out"; FAIL=1 ;;
+esac
+# 竞争采购待收的到货：4+4 抢 5，不能共同超量成功
+D21="$TMP/data21"
+node "$APP" -d "$D21" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D21" po register PO1 --supplier S1 --wh W1 --item P1:5 >/dev/null
+: > "$TMP/race-arr.res"
+( node "$APP" -d "$D21" arrival AR1 --po PO1 --item P1:4 >/dev/null 2>&1; echo $? ) >> "$TMP/race-arr.res" &
+( node "$APP" -d "$D21" arrival AR2 --po PO1 --item P1:4 >/dev/null 2>&1; echo $? ) >> "$TMP/race-arr.res" &
+wait
+codes=$(sort "$TMP/race-arr.res" | tr -d '\n')
+[ "$codes" = "01" ] && echo "ok   - 竞争采购待收的到货不超量成功（4+4 抢 5：1 成 1 拒）" || { echo "FAIL - 竞争到货退出码异常：$codes"; FAIL=1; }
+out=$(node "$APP" -d "$D21" po show PO1)
+check "竞争到货后待到货精确为 1" "P1	5	4	1	部分到货" "$out"
+# 首次创建数据目录的并发写入同样协调
+D24="$TMP/data24"
+: > "$TMP/race-init.res"
+( node "$APP" -d "$D24" product add P1 螺丝 >/dev/null 2>&1; echo $? ) >> "$TMP/race-init.res" &
+( node "$APP" -d "$D24" product add P2 螺母 >/dev/null 2>&1; echo $? ) >> "$TMP/race-init.res" &
+wait
+nok=$(grep -c '^0$' "$TMP/race-init.res")
+[ "$nok" -eq 2 ] && echo "ok   - 首次创建数据目录的并发写入均成功" || { echo "FAIL - 并发首次创建成功数 $nok"; FAIL=1; }
+out=$(node "$APP" -d "$D24" product list)
+check "并发首次创建后两商品都在（P1）" "P1	螺丝" "$out"
+check "并发首次创建后两商品都在（P2）" "P2	螺母" "$out"
+# 等待上限：数据目录正忙时报标准错误退出 1，不留变动；仍存活写进程不被抢占
+D22="$TMP/data22"
+mkdir -p "$D22"
+sleep 30 & BUSY_PID=$!
+printf '%s other\n' "$BUSY_PID" > "$D22/.stockroom.json.lock"
+out=$(STOCKROOM_LOCK_WAIT_MS=600 node "$APP" -d "$D22" product add P1 螺丝 2>&1 >/dev/null); code=$?
+kill "$BUSY_PID" 2>/dev/null; wait "$BUSY_PID" 2>/dev/null
+if [ $code -ne 1 ]; then
+  echo "FAIL - 等待超时退出码应为 1，实际 $code"; FAIL=1
+else
+  check "等待超时明确说明数据目录正忙（不抢占仍存活写进程）" "数据目录正忙" "$out"
+fi
+[ ! -e "$D22/stockroom.json" ] && echo "ok   - 超时未留下本请求任何变动" || { echo "FAIL - 超时留下了数据文件"; FAIL=1; }
+rm -f "$D22/.stockroom.json.lock"
+# 符号链接路径与真实路径指向同一目录时共用协调；不同目录互不阻塞
+D25="$TMP/data25"
+mkdir -p "$D25"
+ln -s "$D25" "$TMP/data25-link"
+sleep 30 & BUSY2=$!
+printf '%s other\n' "$BUSY2" > "$D25/.stockroom.json.lock"
+out=$(STOCKROOM_LOCK_WAIT_MS=500 node "$APP" -d "$TMP/data25-link" product add P1 x 2>&1 >/dev/null); code=$?
+kill "$BUSY2" 2>/dev/null; wait "$BUSY2" 2>/dev/null
+[ $code -eq 1 ] && echo "ok   - 符号链接路径与真实路径共用同一把锁" || { echo "FAIL - 符号链接路径未共用锁（退出码 $code）"; FAIL=1; }
+out=$(node "$APP" -d "$TMP/data26" product add P1 x 2>&1); code=$?
+[ $code -eq 0 ] && echo "ok   - 不同数据目录互不阻塞" || { echo "FAIL - 不同目录被阻塞：$out"; FAIL=1; }
+rm -f "$D25/.stockroom.json.lock"
+# 写进程异常退出（SIGKILL）后自动恢复：遗留锁与临时文件无需手工删除，
+# 遗留临时内容不被当作已提交数据
+D23="$TMP/data23"
+mkdir -p "$D23"
+node -e 'require("node:fs").writeFileSync(process.argv[1], process.pid + " t\n"); process.kill(process.pid, "SIGKILL")' "$D23/.stockroom.json.lock" &
+CRASH_PID=$!
+wait $CRASH_PID 2>/dev/null
+printf '{not json' > "$D23/.stockroom.json.$CRASH_PID.tmp"
+out=$(node "$APP" -d "$D23" product add P1 螺丝 2>&1); code=$?
+[ $code -eq 0 ] && echo "ok   - 异常退出遗留锁自动恢复，无需手工删除" || { echo "FAIL - 遗留锁未自动恢复：$out"; FAIL=1; }
+[ ! -e "$D23/.stockroom.json.lock" ] && echo "ok   - 写入结束后释放锁" || { echo "FAIL - 写入结束后锁未释放"; FAIL=1; }
+[ ! -e "$D23/.stockroom.json.$CRASH_PID.tmp" ] && echo "ok   - 异常遗留临时文件被清理" || { echo "FAIL - 遗留临时文件未清理"; FAIL=1; }
+out=$(node "$APP" -d "$D23" product list)
+check "遗留临时内容未被当作已提交数据" "P1	螺丝" "$out"
+# 整批导入作为整批参与协调：与单条写入不交错生效
+D27="$TMP/data27"
+node "$APP" -d "$D27" product add P1 螺丝 >/dev/null
+cat > "$TMP/imp-race.json" <<'EOF'
+[
+  {"type":"in","id":"BI1","wh":"W1","items":[{"product":"P1","qty":2}]},
+  {"type":"in","id":"BI2","wh":"W1","items":[{"product":"P1","qty":3}]}
+]
+EOF
+node "$APP" -d "$D27" import --file "$TMP/imp-race.json" >/dev/null 2>&1 &
+node "$APP" -d "$D27" in BS1 --wh W1 --item P1:4 >/dev/null 2>&1 &
+wait
+out=$(node "$APP" -d "$D27" balance P1 --wh W1)
+check "导入与单条写入不交错生效（2+3+4）" "余量：商品 P1 仓库 W1 = 9" "$out"
+# 并行全重复导入：不改写数据文件、不重复生效
+sum1=$(cksum < "$D27/stockroom.json")
+node "$APP" -d "$D27" import --file "$TMP/imp-race.json" >/dev/null 2>&1 &
+node "$APP" -d "$D27" import --file "$TMP/imp-race.json" >/dev/null 2>&1 &
+wait
+sum2=$(cksum < "$D27/stockroom.json")
+[ "$sum1" = "$sum2" ] && echo "ok   - 并行全重复导入不改写数据文件" || { echo "FAIL - 全重复导入改写了数据文件"; FAIL=1; }
+out=$(node "$APP" -d "$D27" balance P1 --wh W1)
+check "重放不重复生效" "余量：商品 P1 仓库 W1 = 9" "$out"
+# 并行方案执行：只落单一次，其余返回原结果
+D29="$TMP/data29"
+node "$APP" -d "$D29" product add Q1 扳手 >/dev/null
+node "$APP" -d "$D29" rule set Q1 --wh W1 --min 5 --target 10 >/dev/null
+node "$APP" -d "$D29" plan save PLP --purchase Q1:W1:PP1:供应商X >/dev/null
+node "$APP" -d "$D29" plan execute PLP >/dev/null 2>&1 &
+node "$APP" -d "$D29" plan execute PLP >/dev/null 2>&1 &
+wait
+out=$(node "$APP" -d "$D29" po show PP1)
+check "并行方案执行只落单一次（待到货 10）" "Q1	10	0	10	未到货" "$out"
+# 只读查询不创建协调文件
+D28="$TMP/data28"
+node "$APP" -d "$D28" balance P1 >/dev/null
+[ ! -e "$D28" ] && echo "ok   - 只读查询不创建数据目录与协调文件" || { echo "FAIL - 只读查询创建了数据目录"; FAIL=1; }
+node "$APP" -d "$D20" balance P1 >/dev/null
+[ ! -e "$D20/.stockroom.json.lock" ] && echo "ok   - 只读查询不创建锁文件" || { echo "FAIL - 只读查询创建了锁文件"; FAIL=1; }
+unset STOCKROOM_LOCK_WAIT_MS
 
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
