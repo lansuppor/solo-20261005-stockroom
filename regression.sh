@@ -1,5 +1,6 @@
 #!/bin/sh
-# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议。
+# stockroom 本地回归检查：精度边界、取消与冲销、批量回滚、重载及历史重放、补货规则与跨仓补货建议、
+# 补货方案保存/执行/整案撤回、期间库存对账报表、采购待收转单。
 # 用法：sh regression.sh （在仓库根目录执行；需要 Node.js 24）
 set -u
 cd "$(dirname "$0")"
@@ -23,7 +24,7 @@ check_refuse() { # check_refuse <描述> <期望错误文本> <命令...>
   desc=$1; want=$2; shift 2
   out=$(run "$@" 2>&1); code=$?
   if [ $code -ne 1 ]; then
-    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+    echo "FAIL - ${desc}（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
   else
     check "$desc" "$want" "$out"
   fi
@@ -223,7 +224,7 @@ check_refuse7() { # check_refuse7 <描述> <期望错误文本> <命令...>（�
   desc=$1; want=$2; shift 2
   out=$(run7 "$@" 2>&1); code=$?
   if [ $code -ne 1 ]; then
-    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+    echo "FAIL - ${desc}（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
   else
     check "$desc" "$want" "$out"
   fi
@@ -366,7 +367,7 @@ check_refuse9() { # check_refuse9 <描述> <期望错误文本> <命令...>（�
   desc=$1; want=$2; shift 2
   out=$(run9 "$@" 2>&1); code=$?
   if [ $code -ne 1 ]; then
-    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+    echo "FAIL - ${desc}（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
   else
     check "$desc" "$want" "$out"
   fi
@@ -546,7 +547,7 @@ check_refuse12() { # check_refuse12 <描述> <期望错误文本> <命令...>
   desc=$1; want=$2; shift 2
   out=$(run12 "$@" 2>&1); code=$?
   if [ $code -ne 1 ]; then
-    echo "FAIL - $desc（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+    echo "FAIL - ${desc}（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
   else
     check "$desc" "$want" "$out"
   fi
@@ -702,6 +703,190 @@ out=$(run12 po-transfer 2>&1); code=$?
 [ $code -eq 2 ] || { echo "FAIL - po-transfer 缺参数退出码应为 2，实际 $code"; FAIL=1; }
 out=$(run12 po-transfer F1 --orig PO1 --dest PO2 2>&1); code=$?
 [ $code -eq 2 ] || { echo "FAIL - po-transfer 缺 --supplier/--wh 退出码应为 2，实际 $code"; FAIL=1; }
+
+echo "== 12. 补货方案整案撤回 =="
+D13="$TMP/data13"
+run13() { node "$APP" -d "$D13" "$@"; }
+check_refuse13() { # check_refuse13 <描述> <期望错误文本> <命令...>
+  desc=$1; want=$2; shift 2
+  out=$(run13 "$@" 2>&1); code=$?
+  if [ $code -ne 1 ]; then
+    echo "FAIL - ${desc}（退出码应为 1，实际 $code）"; echo "  输出: $out"; FAIL=1
+  else
+    check "$desc" "$want" "$out"
+  fi
+}
+run13 product add Q1 扳手 >/dev/null
+run13 in G1 --wh W1 --item Q1:3 >/dev/null
+run13 in G2 --wh W2 --item Q1:12 >/dev/null
+run13 rule set Q1 --wh W1 --min 8 --target 20 >/dev/null
+run13 rule set Q1 --wh W2 --min 2 --target 10 >/dev/null
+# W1 缺口 17：W2 调拨 2、采购 15
+run13 plan save PL1 --transfer Q1:W2:W1:T1 --purchase Q1:W1:PO9:华东五金 >/dev/null
+check_refuse13 "待执行方案不可撤回" "尚未执行，仅允许撤回已执行且未撤回的方案" \
+  plan withdraw W0 --plan PL1 --transfer-rev T1:R1 --purchase-cancel PO9:X1
+run13 plan execute PL1 >/dev/null
+# 映射逐一对应：缺漏、多余、重复、彼此重号均整案拒绝
+check_refuse13 "缺少采购映射拒绝" "缺少采购子单 PO9 的取消单号指定" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R1
+check_refuse13 "多余调拨映射拒绝" "多余的调拨子单指定 T2" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R1 --transfer-rev T2:R2 --purchase-cancel PO9:X1
+check_refuse13 "重复指定同一子单拒绝" "调拨子单 T1 的冲销单号重复指定" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R1 --transfer-rev T1:R2 --purchase-cancel PO9:X1
+check_refuse13 "新子单号彼此重号拒绝" "彼此不得重号" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:X1 --purchase-cancel PO9:X1
+check_refuse13 "请求编号已占用拒绝" "撤回请求编号 G1 已用于入库/出库/调拨/盘点单" \
+  plan withdraw G1 --plan PL1 --transfer-rev T1:R1 --purchase-cancel PO9:X1
+check_refuse13 "新冲销单号已占用即使内容相同也拒绝" "已被入库/出库/调拨/盘点单占用（即使内容相同也不接管）" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:G2 --purchase-cancel PO9:X1
+# 进度不符：采购子单有有效到货时拒绝；合法恢复全量待收后允许
+run13 arrival A1 --po PO9 --item Q1:5 >/dev/null
+check_refuse13 "采购子单非全量待收拒绝" "采购子单 PO9 商品 Q1 已非全量待收（有效到货 5，有效取消 0）" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R1 --purchase-cancel PO9:X1
+run13 reverse RA --orig A1 >/dev/null   # 冲销到货，恢复全量待收
+# 调拨子单已冲销时拒绝（另案验证见下）；缺货整案拒绝且不占编号
+run13 out O1 --wh W1 --item Q1:4 >/dev/null   # W1 余量 1，不足扣回调拨 2
+check_refuse13 "调入仓缺货整案拒绝" "原调入仓 W1 当前余量 1 不足扣回 2" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R1 --purchase-cancel PO9:X1
+out=$(run13 plan show PL1)
+check "失败后方案保持已执行未撤回" "状态 已执行，调拨 1 份、采购 1 份" "$out"
+run13 reverse RO --orig O1 >/dev/null    # 恢复 W1 余量（W1 = 1+4=5）
+# 失败不占编号：条件改善后同号（W1/R1/X1）重试成功
+out=$(run13 plan withdraw W1 --plan PL1 --transfer-rev T1:R1 --purchase-cancel PO9:X1)
+check "整案撤回成功" "撤回请求 W1 提交成功，撤回补货方案 PL1：调拨冲销 1 份、采购取消 1 份：" "$out"
+check "调拨子单冲销前后值" "冲销调拨 原单=T1 商品=Q1 W1 -> W2 2：W1 5->3；W2 10->12" "$out"
+check "采购子单取消完整订购量" "取消 Q1 x15：有效取消 15，待到货 0" "$out"
+out=$(run13 balance Q1 --wh W2)
+check "撤回后库存真实可读（W2 补回 12）" "余量：商品 Q1 仓库 W2 = 12" "$out"
+out=$(run13 po show PO9)
+check "撤回后采购待收归零（已结清含取消）" "Q1	15	0	15	0	已结清（含取消）" "$out"
+out=$(run13 flow --product Q1 --wh W2)
+check "冲销流水真实可读" "单据=R1	冲销调拨	商品=Q1	仓库=W2	+2	10->12	调拨=W2->W1	原单=T1" "$out"
+out=$(run13 plan show PL1)
+check "plan show 展示已撤回状态" "状态 已执行（已撤回）" "$out"
+check "plan show 展示撤回关联" "调拨子单 T1 -> 冲销单 R1" "$out"
+check "plan show 展示取消关联" "采购子单 PO9 -> 取消单 X1" "$out"
+out=$(run13 plan list)
+check "plan list 展示撤回状态与请求" "PL1	已执行（已撤回）	调拨 1 份	采购 1 份	撤回请求=W1" "$out"
+# 幂等：同请求编号、同方案及子单映射重放返回原结果，不改写文件
+sum1=$(cksum < "$D13/stockroom.json")
+out=$(run13 plan withdraw W1 --plan PL1 --purchase-cancel PO9:X1 --transfer-rev T1:R1)
+check "同号同映射重放返回原结果" "撤回请求 W1 为重复提交" "$out"
+sum2=$(cksum < "$D13/stockroom.json")
+[ "$sum1" = "$sum2" ] && echo "ok   - 撤回重放不改写文件" || { echo "FAIL - 撤回重放改写了文件"; FAIL=1; }
+check_refuse13 "同请求编号改映射拒绝" "撤回请求编号 W1 已用于内容不同的撤回" \
+  plan withdraw W1 --plan PL1 --transfer-rev T1:R2 --purchase-cancel PO9:X1
+check_refuse13 "每案最多成功撤回一次" "已被撤回请求 W1 撤回，每案最多成功撤回一次" \
+  plan withdraw W2 --plan PL1 --transfer-rev T1:R9 --purchase-cancel PO9:X9
+check_refuse13 "撤回请求本身不可冲销" "撤回请求不可冲销" reverse RW --orig W1
+check_refuse13 "撤回请求编号不能再作普通单据" "已用于方案撤回请求" in W1 --wh W1 --item Q1:1
+# 撤回后 plan execute 与原子单重放仍返回原成功结果，不重新落单
+out=$(run13 plan execute PL1)
+check "撤回后 plan execute 重放原结果" "已执行，返回原落单结果" "$out"
+out=$(run13 transfer T1 --from W2 --to W1 --item Q1:2)
+check "原子单重放仍返回原结果" "为重复提交" "$out"
+out=$(run13 balance Q1 --wh W2)
+check "重放不重新落单（W2 仍为 12）" "余量：商品 Q1 仓库 W2 = 12" "$out"
+# 新取消单可按普通规则冲销，但方案保持已撤回
+out=$(run13 reverse RC --orig X1)
+check "新取消单可按普通规则冲销" "冲销取消 原单=X1 采购单=PO9 商品=Q1 本次恢复取消量 15" "$out"
+check_refuse13 "取消冲销后方案仍保持已撤回" "每案最多成功撤回一次" \
+  plan withdraw W3 --plan PL1 --transfer-rev T1:R8 --purchase-cancel PO9:X8
+# 只有调拨 / 只有采购的方案也支持
+D14="$TMP/data14"
+run14() { node "$APP" -d "$D14" "$@"; }
+run14 product add Q1 扳手 >/dev/null
+run14 in G1 --wh W2 --item Q1:50 >/dev/null
+run14 rule set Q1 --wh W1 --min 8 --target 20 >/dev/null
+run14 rule set Q1 --wh W2 --min 2 --target 10 >/dev/null
+run14 plan save PLT --transfer Q1:W2:W1:TT1 >/dev/null
+run14 plan execute PLT >/dev/null
+out=$(run14 plan withdraw WT --plan PLT --transfer-rev TT1:RR1)
+check "只有调拨的方案撤回" "撤回请求 WT 提交成功，撤回补货方案 PLT：调拨冲销 1 份、采购取消 0 份：" "$out"
+D15="$TMP/data15"
+run15() { node "$APP" -d "$D15" "$@"; }
+run15 product add Q1 扳手 >/dev/null
+run15 rule set Q1 --wh W1 --min 8 --target 20 >/dev/null
+run15 plan save PLP --purchase Q1:W1:PP1:供应商 >/dev/null
+run15 plan execute PLP >/dev/null
+out=$(run15 plan withdraw WP --plan PLP --purchase-cancel PP1:CC1)
+check "只有采购的方案撤回" "撤回请求 WP 提交成功，撤回补货方案 PLP：调拨冲销 0 份、采购取消 1 份：" "$out"
+# 调拨子单已被冲销的方案不可撤回
+D16="$TMP/data16"
+run16() { node "$APP" -d "$D16" "$@"; }
+run16 product add Q1 扳手 >/dev/null
+run16 in G1 --wh W2 --item Q1:50 >/dev/null
+run16 rule set Q1 --wh W1 --min 8 --target 20 >/dev/null
+run16 rule set Q1 --wh W2 --min 2 --target 10 >/dev/null
+run16 plan save PLT --transfer Q1:W2:W1:TT1 >/dev/null
+run16 plan execute PLT >/dev/null
+run16 reverse RV1 --orig TT1 >/dev/null
+out=$(run16 plan withdraw WT --plan PLT --transfer-rev TT1:RR1 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 调拨子单已冲销应拒绝撤回（退出码 1，实际 $code）"; FAIL=1
+else
+  check "调拨子单已冲销拒绝撤回" "调拨子单 TT1 已被冲销单 RV1 冲销" "$out"
+fi
+# 特殊标识：__proto__ 与含冒号新单号正常使用
+D17="$TMP/data17"
+node "$APP" -d "$D17" product add '__proto__' 特殊件 >/dev/null
+node "$APP" -d "$D17" rule set '__proto__' --wh W1 --min 5 --target 10 >/dev/null
+node "$APP" -d "$D17" plan save '__proto__' --purchase '__proto__:W1:__proto__:供应商X' >/dev/null
+node "$APP" -d "$D17" plan execute '__proto__' >/dev/null
+out=$(node "$APP" -d "$D17" plan withdraw '__proto__' --plan '__proto__' --purchase-cancel '__proto__:X:1')
+check "__proto__ 方案撤回（新单号含冒号）" "撤回请求 __proto__ 提交成功" "$out"
+out=$(node "$APP" -d "$D17" plan show '__proto__')
+check "__proto__ 撤回关联可读" "采购子单 __proto__ -> 取消单 X:1" "$out"
+# 重启（新进程）后撤回状态与限制仍成立
+out=$(node "$APP" -d "$D17" plan withdraw '__proto__' --plan '__proto__' --purchase-cancel '__proto__:X:1')
+check "重启后撤回重放仍成立" "撤回请求 __proto__ 为重复提交" "$out"
+out=$(node "$APP" -d "$D17" reverse R9 --orig '__proto__' 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 重启后撤回请求仍不可冲销" || { echo "FAIL - 重启后撤回请求冲销限制失效"; FAIL=1; }
+# 损坏数据：撤回关联缺失或内容不符拒读
+BAD13="$TMP/bad13"
+mkdir -p "$BAD13"
+cat > "$BAD13/stockroom.json" <<'EOF'
+{"version":1,"products":{"Q9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W1","ordered":{"Q9":3},"resultLines":[]}},
+ "arrivals":{},"cancels":{"C9":{"poId":"PO9","qty":{"Q9":3},"resultLines":[]}},
+ "returns":{},"rules":{"Q9":{"W1":{"min":1,"target":5}}},
+ "plans":{"PL9":{"planId":"PL9","status":"executed","execResultLines":["x"],
+   "transfers":[],"purchases":[{"poId":"PO9","supplier":"S","wh":"W1","product":"Q9","qty":3}],
+   "snapshot":{"rules":{"Q9":{"W1":{"min":1,"target":5}}},"stock":{"Q9":{"W1":0}},"pending":{"Q9":{"W1":"0"}}}}},
+ "planWithdrawals":{"W9":{"reqId":"W9","planId":"PL9","transferRevs":{},"purchaseCancels":{"PO9":"C9"},"resultLines":[]}}}
+EOF
+out=$(node "$APP" -d "$BAD13" plan list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 方案缺撤回标记应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "撤回关联断裂拒读（方案未标记）" "撤回标记不一致（关联断裂）" "$out"
+fi
+cat > "$BAD13/stockroom.json" <<'EOF'
+{"version":1,"products":{"Q9":"x"},"stock":{},"entries":[],"docs":{},"reversals":{},
+ "purchases":{"PO9":{"poId":"PO9","supplier":"S","wh":"W1","ordered":{"Q9":3},"resultLines":[]}},
+ "arrivals":{},"cancels":{"C9":{"poId":"PO9","qty":{"Q9":2},"resultLines":[]}},
+ "returns":{},"rules":{"Q9":{"W1":{"min":1,"target":5}}},
+ "plans":{"PL9":{"planId":"PL9","status":"executed","execResultLines":["x"],"withdrawnBy":"W9",
+   "transfers":[],"purchases":[{"poId":"PO9","supplier":"S","wh":"W1","product":"Q9","qty":3}],
+   "snapshot":{"rules":{"Q9":{"W1":{"min":1,"target":5}}},"stock":{"Q9":{"W1":0}},"pending":{"Q9":{"W1":"0"}}}}},
+ "planWithdrawals":{"W9":{"reqId":"W9","planId":"PL9","transferRevs":{},"purchaseCancels":{"PO9":"C9"},"resultLines":[]}}}
+EOF
+out=$(node "$APP" -d "$BAD13" plan list 2>&1); code=$?
+if [ $code -ne 1 ]; then
+  echo "FAIL - 取消单内容不符应拒读（退出码 1，实际 $code）"; FAIL=1
+else
+  check "撤回取消单内容不符拒读" "与采购子单 PO9 完整订购量不符" "$out"
+fi
+# 旧数据无 planWithdrawals 字段按无撤回加载并保留原结果
+out=$(node "$APP" -d "$BAD6" plan list)
+check "旧数据无撤回字段按无撤回处理" "（暂无补货方案）" "$out"
+# 格式错误退出 2
+out=$(run13 plan withdraw 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - plan withdraw 缺参数退出码应为 2，实际 $code"; FAIL=1; }
+out=$(run13 plan withdraw W9 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - plan withdraw 缺 --plan 退出码应为 2，实际 $code"; FAIL=1; }
+out=$(run13 plan withdraw W9 --plan PL1 --transfer-rev T1 2>&1); code=$?
+[ $code -eq 2 ] || { echo "FAIL - 映射格式错误退出码应为 2，实际 $code"; FAIL=1; }
 
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
