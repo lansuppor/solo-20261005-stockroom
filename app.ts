@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 // stockroom —— 本地多仓库存台账（Node.js 24，TypeScript，无外部运行依赖）
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const APP_NAME = 'stockroom';
 const DATA_FILENAME = 'stockroom.json';
 const DEFAULT_DATA_DIR = '.stockroom';
+const LOCK_FILENAME = '.stockroom.lock'; // 数据目录内的写入协调文件（仅写命令创建）
+const LOCK_WAIT_LIMIT_MS = 10_000; // 等待写入机会的默认上限（可用 STOCKROOM_LOCK_WAIT_MS 覆盖）
+const LOCK_POLL_MS = 40; // 等待写入机会的轮询间隔
+const LOCK_ORPHAN_GRACE_MS = 2_000; // 无有效持有者信息的锁文件超过此时长才按遗留回收
 
 class UsageError extends Error {} // 命令行用法错误 -> 退出码 2
 class BizError extends Error {} // 业务拒绝 -> 退出码 1
@@ -1131,6 +1135,173 @@ function saveStore(dataDir: string, store: Store): void {
     renameSync(tmp, path);
   } catch (e) {
     throw new DataError(`保存数据失败，已有数据保持不变：${(e as Error).message}`);
+  }
+}
+
+// ---------- 多进程写入协调 ----------
+//
+// 同一数据目录的写命令（商品/规则/方案维护、单据提交、整批导入等）串行执行：
+// 先在数据目录内排他创建锁文件取得写入机会，再读取最新已提交状态、完成业务
+// 校验与去重，全部变化原子保存后才释放并报告成功。锁文件位于数据目录内部，
+// 相对、绝对及符号链接路径指向同一目录时自然是同一个文件，因而共用协调；
+// 不同数据目录各有锁文件，互不阻塞。锁文件记录持有者进程号：持有者仍存活
+// 时无论已等待多久都不抢占；持有者已退出（或锁文件缺少有效持有者信息且已
+// 停留较久）时由后续写入自动回收，无需手工删文件。等待有上限，超时明确
+// 报告数据目录正忙（退出 1），本请求不做任何改动。
+
+/** 等待写入机会的上限：默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS（正整数毫秒）覆盖。 */
+function lockWaitLimitMs(): number {
+  const raw = process.env.STOCKROOM_LOCK_WAIT_MS;
+  if (raw !== undefined) {
+    const s = raw.trim();
+    if (/^\d+$/.test(s)) {
+      const n = Number(s);
+      if (Number.isSafeInteger(n) && n > 0) return n;
+    }
+  }
+  return LOCK_WAIT_LIMIT_MS;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** 读取锁文件记录的持有者进程号；内容缺失或非法时返回 undefined。 */
+function readLockHolderPid(lockPath: string): number | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(lockPath, 'utf8').trim();
+  } catch {
+    return undefined; // 读取失败按无有效持有者信息处理
+  }
+  if (!/^\d+$/.test(raw)) return undefined;
+  const pid = Number(raw);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** 进程是否仍存活（无权限发送信号也视为存活，绝不误抢）。 */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** 锁文件缺少有效持有者信息时，只有停留超过宽限时长才按遗留回收（避让刚创建尚未写入的锁）。 */
+function lockIsOrphaned(lockPath: string): boolean {
+  try {
+    return Date.now() - statSync(lockPath).mtimeMs > LOCK_ORPHAN_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 取得数据目录的写入机会，返回释放函数。排他创建锁文件成功即取得；
+ * 锁已存在时：持有者存活则有限等待，持有者已退出或锁已遗留则原子改名回收后重新竞争。
+ * 超时抛出 DataError（数据目录正忙，退出 1），不留下本请求的任何改动。
+ */
+function acquireWriteLock(dataDir: string): () => void {
+  const lockPath = join(dataDir, LOCK_FILENAME);
+  try {
+    mkdirSync(dataDir, { recursive: true }); // 首次创建数据目录同样在协调保护下进行
+  } catch (e) {
+    throw new DataError(`无法创建数据目录 ${dataDir}：${(e as Error).message}`);
+  }
+  const waitLimit = lockWaitLimitMs();
+  const deadline = Date.now() + waitLimit;
+  for (;;) {
+    try {
+      // 排他创建并写入持有者进程号；成功即取得写入机会
+      writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          unlinkSync(lockPath); // 只删除自己持有的锁：持有者存活期间不会被回收
+        } catch {
+          /* 锁已不存在（异常情况下被遗留回收）时忽略 */
+        }
+      };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new DataError(`无法创建写入协调文件 ${lockPath}：${(e as Error).message}`);
+      }
+    }
+    const holderPid = readLockHolderPid(lockPath);
+    if (holderPid !== undefined && pidAlive(holderPid)) {
+      // 持有者仍存活：无论已等待多久都不抢占，只在自己的等待上限内轮询
+    } else if (holderPid !== undefined || lockIsOrphaned(lockPath)) {
+      // 持有者进程已退出，或锁文件缺少有效持有者信息且已停留较久：原子改名回收。
+      // 竞争回收者中只有一个改名成功，随后各自以排他创建重新竞争写入机会；
+      // 改名只移动锁文件本身，不会触碰其他写请求的临时内容。
+      const junk = `${lockPath}.stale.${process.pid}`;
+      try {
+        renameSync(lockPath, junk);
+      } catch {
+        continue; // 他人已回收或锁刚好被重建：重新竞争
+      }
+      try {
+        unlinkSync(junk);
+      } catch {
+        /* 清理失败不影响后续竞争 */
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new DataError(
+        `数据目录正忙：等待写入机会超过 ${waitLimit} 毫秒（可能有其他 ${APP_NAME} 进程正在写入 ${dataDir}），` +
+          `本请求未做任何改动，请稍后重试`,
+      );
+    }
+    sleepSync(LOCK_POLL_MS);
+  }
+}
+
+/**
+ * 在写入协调保护下执行写命令：取得写入机会后 fn 内部读取的才是最新已提交
+ * 状态，业务校验、去重与原子保存全部在保护内完成；成功、业务拒绝、读写
+ * 失败或参数错误都会释放占用。
+ */
+function withWriteLock(dataDir: string, fn: () => void): void {
+  const release = acquireWriteLock(dataDir);
+  try {
+    fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * 判断本次调用是否可能改变数据（需要写入协调）。只读查询（list/show/
+ * balance/flow/recon/replenish 等）不加锁、不创建协调文件。
+ */
+function isWriteInvocation(cmd: string, tokens: string[]): boolean {
+  switch (cmd) {
+    case 'in':
+    case 'out':
+    case 'transfer':
+    case 'count':
+    case 'reverse':
+    case 'arrival':
+    case 'cancel':
+    case 'return':
+    case 'po-transfer':
+    case 'import':
+      return true;
+    case 'product':
+      return tokens[0] === 'add';
+    case 'po':
+      return tokens[0] === 'register';
+    case 'rule':
+      return tokens[0] === 'set' || tokens[0] === 'delete' || tokens[0] === 'del';
+    case 'plan':
+      return tokens[0] === 'save' || tokens[0] === 'execute' || tokens[0] === 'withdraw';
+    default:
+      return false;
   }
 }
 
@@ -4811,6 +4982,17 @@ function run(argv: string[]): void {
   }
 
   const tokens = rest.slice(1);
+  // 可能改变数据的命令：先取得数据目录的写入机会，再在保护内读取最新已提交
+  // 状态、校验、去重并原子保存；只读命令直接读取，不创建协调文件。
+  if (isWriteInvocation(cmd, tokens)) {
+    withWriteLock(dataDir, () => dispatchCommand(cmd, tokens, dataDir));
+  } else {
+    dispatchCommand(cmd, tokens, dataDir);
+  }
+}
+
+/** 命令分发：写命令由调用方在写入协调保护下调用（loadStore 读到的是最新已提交状态）。 */
+function dispatchCommand(cmd: string, tokens: string[], dataDir: string): void {
   switch (cmd) {
     case 'product': {
       const store = loadStore(dataDir);
