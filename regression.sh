@@ -1472,5 +1472,163 @@ nlocks=$(ls -a "$D45" | grep -c '^\.stockroom\.json\.lock' || true)
 [ "$nlocks" -eq 0 ] && echo "ok   - 采购接任竞态后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D45")"; FAIL=1; }
 unset STOCKROOM_LOCK_WAIT_MS
 
+echo "== 16. 三请求交错：迟到还原窗口、第三请求认领与窗口中崩溃（确定性同步） =="
+# 精确安排“两个请求先确认同一旧协调者已死 → 先到者取得协调资格 → 迟到者搬走其
+# 存活 coord → 还原前第三请求认领 coord 并接任”。修复后：迟到还原只用 link（绝不
+# 覆盖第三者），失去资格者在接任 rename 前的最窄一点让贤（绝不替换闸门）。
+export STOCKROOM_LOCK_WAIT_MS=30000
+
+echo "-- 16.1 迟到者搬走存活 coord 后、还原前第三请求接任：不覆盖、不让失去资格者替换闸门 --"
+D50="$TMP/data50"; SY50="$TMP/sy50"; rm -rf "$D50" "$SY50"; mkdir -p "$D50" "$SY50"
+node "$APP" -d "$D50" product add P1 螺丝 >/dev/null
+setup_dead_coord_lock "$D50"
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY50'/a-dead","wait":"'$SY50'/a1go"},{"point":"take-before","signal":"'$SY50'/a-ready","wait":"'$SY50'/a2go"},{"point":"coord-lost","signal":"'$SY50'/a-lost"},{"point":"take-after","signal":"'$SY50'/a-held"}]' \
+  node "$APP" -d "$D50" in A1 --wh W1 --item P1:10 >"$SY50/a.out" 2>&1 &
+AP=$!
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY50'/b-dead","wait":"'$SY50'/b1go"},{"point":"coord-moved","signal":"'$SY50'/b-moved","wait":"'$SY50'/b2go"},{"point":"coord-restore-busy","signal":"'$SY50'/b-busy"},{"point":"coord-restore","signal":"'$SY50'/b-restored"}]' \
+  node "$APP" -d "$D50" in B1 --wh W1 --item P1:7 >"$SY50/b.out" 2>&1 &
+BP=$!
+wait_for "$SY50/a-dead"; wait_for "$SY50/b-dead"
+touch "$SY50/a1go"; wait_for "$SY50/a-ready"          # A 当选协调者、建好锚点，停在接任 rename 前（闸门仍死）
+touch "$SY50/b1go"; wait_for "$SY50/b-moved"          # B 搬走的其实是 A 的存活 coord，停在还原前（coord 名缺失）
+# 第三请求 C 在“搬走后、还原前”认领 coord 并接任闸门，持闸暂停
+STOCKROOM_TEST_SYNC='{"point":"take-after","signal":"'$SY50'/c-held","wait":"'$SY50'/cgo"}' \
+  node "$APP" -d "$D50" in C1 --wh W1 --item P1:5 >"$SY50/c.out" 2>&1 &
+CP=$!
+wait_for "$SY50/c-held"
+g=$(ino "$D50/.stockroom.json.lock"); cc=$(ino "$D50/.stockroom.json.lock.coord")
+[ "$g" = "$cc" ] && echo "ok   - 第三请求 C 接任后 gate 与 coord 同为其 inode" || { echo "FAIL - gate/coord inode 不一致"; FAIL=1; }
+cp_pid=$(head -1 "$D50/.stockroom.json.lock.coord" | awk '{print $1}')
+[ "$cp_pid" = "$CP" ] && echo "ok   - coord 内容记录第三请求进程号 $CP" || { echo "FAIL - coord pid=$cp_pid != $CP"; FAIL=1; }
+# 放行迟到者 B：link 还原遇第三者 EEXIST，绝不覆盖，让贤
+touch "$SY50/b2go"; wait_for "$SY50/b-busy"
+[ ! -e "$SY50/b-restored" ] && echo "ok   - B 未走“还原成功”（coord 已被第三者 C 认领）" || { echo "FAIL - B 不应还原成功"; FAIL=1; }
+g2=$(ino "$D50/.stockroom.json.lock"); cc2=$(ino "$D50/.stockroom.json.lock.coord")
+[ "$g2" = "$g" ] && [ "$cc2" = "$cc" ] && echo "ok   - 迟到者 B 的还原未覆盖 C 的闸门/coord（inode 不变）" || { echo "FAIL - B 覆盖了第三者占用"; FAIL=1; }
+ntrash=$(ls "$D50" | grep -c 'coord\.reclaimed' || true)
+[ "$ntrash" = "0" ] && echo "ok   - B 的临时回收名随即清理，无残留" || { echo "FAIL - 回收名残留：$(ls "$D50"|gcoord.reclaimed)"; FAIL=1; }
+# 放行 A：最窄一点末点复核发现资格丢失，让贤（绝不替换 C 的闸门）
+touch "$SY50/a2go"; wait_for "$SY50/a-lost"
+[ ! -e "$SY50/a-held" ] && echo "ok   - 已失去资格的 A 未接任闸门" || { echo "FAIL - A 不应持闸"; FAIL=1; }
+g3=$(ino "$D50/.stockroom.json.lock"); cc3=$(ino "$D50/.stockroom.json.lock.coord")
+[ "$g3" = "$g" ] && [ "$cc3" = "$cc" ] && echo "ok   - A 让贤未替换第三者闸门（凭当前状态而非旧检查）" || { echo "FAIL - A 替换了闸门"; FAIL=1; }
+kill -0 "$AP" 2>/dev/null && echo "ok   - A 让贤后存活并转为等待重轮" || { echo "FAIL - A 意外退出"; FAIL=1; }
+# C 先提交释放，A、B 随后串行接任，三笔全入库
+touch "$SY50/cgo"; wait "$CP"; wait "$AP"; ac=$?; wait "$BP"; bc=$?
+[ $ac -eq 0 ] && [ $bc -eq 0 ] && echo "ok   - A、B 让贤后串行接任均成功" || { echo "FAIL - A=$ac B=$bc"; FAIL=1; }
+out=$(node "$APP" -d "$D50" balance P1 --wh W1)
+check "三请求数量全部保留（10+7+5=22）" "余量：商品 P1 仓库 W1 = 22" "$out"
+nflow=$(node "$APP" -d "$D50" flow --product P1 --wh W1 | grep -c '^#')
+[ "$nflow" = "3" ] && echo "ok   - 三请求恰好三笔流水（让贤/等待不占编号）" || { echo "FAIL - 流水数 $nflow"; FAIL=1; }
+seqs=$(node "$APP" -d "$D50" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 3 " ] && echo "ok   - 三请求流水序号 1、2、3 连续" || { echo "FAIL - 序号 $seqs"; FAIL=1; }
+docs=$(node "$APP" -d "$D50" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "A1 B1 C1 " ] && echo "ok   - 三笔编号 A1、B1、C1 齐全" || { echo "FAIL - 编号 $docs"; FAIL=1; }
+nlocks=$(ls -a "$D50" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" = "0" ] && echo "ok   - 三请求结束后无任何闸门/身份/协调/回收物残留" || { echo "FAIL - 残留：$(ls -a "$D50")"; FAIL=1; }
+
+echo "-- 16.2 第三请求认领后即崩溃（连环退出）：迟到者只 link 还原存活接任者，崩溃者不占编号 --"
+D51="$TMP/data51"; SY51="$TMP/sy51"; rm -rf "$D51" "$SY51"; mkdir -p "$D51" "$SY51"
+node "$APP" -d "$D51" product add P1 螺丝 >/dev/null
+setup_dead_coord_lock "$D51"
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY51'/a-dead","wait":"'$SY51'/a1go"},{"point":"take-before","signal":"'$SY51'/a-ready","wait":"'$SY51'/a2go"},{"point":"take-after","signal":"'$SY51'/a-held"}]' \
+  node "$APP" -d "$D51" in A1 --wh W1 --item P1:10 >"$SY51/a.out" 2>&1 &
+AP=$!
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY51'/b-dead","wait":"'$SY51'/b1go"},{"point":"coord-moved","signal":"'$SY51'/b-moved","wait":"'$SY51'/b2go"},{"point":"coord-restore","signal":"'$SY51'/b-restored"}]' \
+  node "$APP" -d "$D51" in B1 --wh W1 --item P1:7 >"$SY51/b.out" 2>&1 &
+BP=$!
+wait_for "$SY51/a-dead"; wait_for "$SY51/b-dead"
+touch "$SY51/a1go"; wait_for "$SY51/a-ready"
+touch "$SY51/b1go"; wait_for "$SY51/b-moved"
+# 第三请求 C 在缺失的 coord 名上当选后、接任前即崩溃（死协调者 + 死闸门）
+STOCKROOM_TEST_CRASH=after-coord node "$APP" -d "$D51" in C1 --wh W1 --item P1:5 >/dev/null 2>&1 &
+CP=$!; wait "$CP" 2>/dev/null
+# B 读到第三者已死：收走其死 coord 后，把 A 的存活 coord link 还原（不是自己当选）
+touch "$SY51/b2go"; wait_for "$SY51/b-restored"
+a_id=$(ls "$D51"/.stockroom.json.lock."$AP".* 2>/dev/null | head -1)
+[ -n "$a_id" ] && [ "$(ino "$D51/.stockroom.json.lock.coord")" = "$(ino "$a_id")" ] \
+  && echo "ok   - 第三者崩溃后 B 把 A 的存活 coord 只增链接地还原（coord inode=A 身份）" \
+  || { echo "FAIL - coord 未还原给 A"; FAIL=1; }
+touch "$SY51/a2go"; wait_for "$SY51/a-held"; wait "$AP"; wait "$BP"
+out=$(node "$APP" -d "$D51" balance P1 --wh W1)
+check "连环退出后数量精确（10+7=17，崩溃的 C 不生效）" "余量：商品 P1 仓库 W1 = 17" "$out"
+docs=$(node "$APP" -d "$D51" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "A1 B1 " ] && echo "ok   - 崩溃的第三请求 C 不占编号（流水仅 A1 B1）" || { echo "FAIL - 编号 $docs"; FAIL=1; }
+nlocks=$(ls -a "$D51" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" = "0" ] && echo "ok   - 死第三者身份/回收物全部清理，无残留" || { echo "FAIL - 残留：$(ls -a "$D51")"; FAIL=1; }
+
+echo "-- 16.3 还原窗口中接任者异常退出：后续写请求自动恢复，暂停的迟到者随后串行，无需手工删文件 --"
+D52="$TMP/data52"; SY52="$TMP/sy52"; rm -rf "$D52" "$SY52"; mkdir -p "$D52" "$SY52"
+node "$APP" -d "$D52" product add P1 螺丝 >/dev/null
+setup_dead_coord_lock "$D52"
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY52'/a-dead","wait":"'$SY52'/a1go"},{"point":"take-before","signal":"'$SY52'/a-ready","wait":"'$SY52'/a-never"}]' \
+  node "$APP" -d "$D52" in A1 --wh W1 --item P1:10 >"$SY52/a.out" 2>&1 &
+AP=$!
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY52'/b-dead","wait":"'$SY52'/b1go"},{"point":"coord-moved","signal":"'$SY52'/b-moved","wait":"'$SY52'/b2go"}]' \
+  node "$APP" -d "$D52" in B1 --wh W1 --item P1:7 >"$SY52/b.out" 2>&1 &
+BP=$!
+wait_for "$SY52/a-dead"; wait_for "$SY52/b-dead"
+touch "$SY52/a1go"; wait_for "$SY52/a-ready"
+touch "$SY52/b1go"; wait_for "$SY52/b-moved"
+kill -9 "$AP" 2>/dev/null; wait "$AP" 2>/dev/null    # A 在“coord 被搬走、尚未还原”的窗口中强杀
+# B 仍暂停；全新请求 D 须凭当前缺失的 coord 名自动当选接任（无需手工删任何文件）
+STOCKROOM_TEST_SYNC='{"point":"take-after","signal":"'$SY52'/d-held"}' \
+  node "$APP" -d "$D52" in D1 --wh W1 --item P1:3 >"$SY52/d.out" 2>&1 &
+DP=$!
+wait_for "$SY52/d-held"    # 确定性放行点：D 已持闸，B 仍暂停
+touch "$SY52/b2go"         # 放行迟到者 B：读到 A 已死，让贤给存活 D，随后排队
+wait "$DP"; dc=$?; wait "$BP"; bc=$?
+[ $dc -eq 0 ] && [ $bc -eq 0 ] && echo "ok   - 窗口中崩溃后 D 自动恢复、暂停的 B 随后串行接任（无需手工删文件）" || { echo "FAIL - D=$dc B=$bc"; cat "$SY52/d.out" "$SY52/b.out"; FAIL=1; }
+out=$(node "$APP" -d "$D52" balance P1 --wh W1)
+check "窗口崩溃的 A 不生效（3+7=10）" "余量：商品 P1 仓库 W1 = 10" "$out"
+docs=$(node "$APP" -d "$D52" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "B1 D1 " ] && echo "ok   - 崩溃的 A 不占编号（流水仅 B1 D1）" || { echo "FAIL - 编号 $docs"; FAIL=1; }
+nlocks=$(ls -a "$D52" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" = "0" ] && echo "ok   - 崩溃窗口恢复后无闸门/身份/锚点/回收物残留" || { echo "FAIL - 残留：$(ls -a "$D52")"; FAIL=1; }
+
+echo "-- 16.4 确定性三请求接任交错下竞争采购待收：不超量、同号只生效一次、改内容拒绝、重放不改写 --"
+D53="$TMP/data53"; SY53="$TMP/sy53"; rm -rf "$D53" "$SY53"; mkdir -p "$D53" "$SY53"
+node "$APP" -d "$D53" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D53" po register PO1 --supplier S1 --wh W1 --item P1:5 >/dev/null
+setup_dead_coord_lock "$D53"
+( STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY53'/a-dead","wait":"'$SY53'/a1go"},{"point":"take-before","signal":"'$SY53'/a-ready","wait":"'$SY53'/a2go"},{"point":"coord-lost","signal":"'$SY53'/a-lost"}]' \
+  node "$APP" -d "$D53" arrival ARA --po PO1 --item P1:4 >"$SY53/a.out" 2>&1; echo $? >"$SY53/a.code" ) &
+AP=$!
+( STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY53'/b-dead","wait":"'$SY53'/b1go"},{"point":"coord-moved","signal":"'$SY53'/b-moved","wait":"'$SY53'/b2go"},{"point":"coord-restore-busy","signal":"'$SY53'/b-busy"}]' \
+  node "$APP" -d "$D53" arrival ARB --po PO1 --item P1:4 >"$SY53/b.out" 2>&1; echo $? >"$SY53/b.code" ) &
+BP=$!
+wait_for "$SY53/a-dead"; wait_for "$SY53/b-dead"
+touch "$SY53/a1go"; wait_for "$SY53/a-ready"
+touch "$SY53/b1go"; wait_for "$SY53/b-moved"
+( STOCKROOM_TEST_SYNC='{"point":"take-after","signal":"'$SY53'/c-held","wait":"'$SY53'/cgo"}' \
+  node "$APP" -d "$D53" arrival ARC --po PO1 --item P1:4 >"$SY53/c.out" 2>&1; echo $? >"$SY53/c.code" ) &
+CP=$!
+wait_for "$SY53/c-held"; touch "$SY53/b2go"; wait_for "$SY53/b-busy"; touch "$SY53/a2go"; wait_for "$SY53/a-lost"; touch "$SY53/cgo"
+wait "$CP"; wait "$AP"; wait "$BP"
+ca=$(cat "$SY53/a.code"); cb=$(cat "$SY53/b.code"); cc=$(cat "$SY53/c.code")
+nok=$(printf '%s\n%s\n%s\n' "$ca" "$cb" "$cc" | grep -c '^0$'); nno=$(printf '%s\n%s\n%s\n' "$ca" "$cb" "$cc" | grep -c '^1$')
+[ "$nok" = "1" ] && [ "$nno" = "2" ] && echo "ok   - 三笔各到货 4 抢待收 5：恰 1 成 2 拒，绝不超量" || { echo "FAIL - 成功 $nok 拒绝 $nno（a=$ca b=$cb c=$cc）"; FAIL=1; }
+out=$(node "$APP" -d "$D53" po show PO1 | grep -E '^P1	')
+case "$out" in *"5	4	"*"1	部分到货"*) echo "ok   - po show：有效到货 4/5、待到货 1，无超收";; *) echo "FAIL - $out"; FAIL=1;; esac
+out=$(node "$APP" -d "$D53" arrival ARD --po PO1 --item P1:1)
+check "剩余 1 件精确收齐" "待到货 0" "$out"
+node "$APP" -d "$D53" arrival ARE --po PO1 --item P1:1 >/dev/null 2>&1 \
+  && { echo "FAIL - 收齐后仍可超量到货"; FAIL=1; } || echo "ok   - 收齐后再到货超量拒绝"
+sum1=$(cksum < "$D53/stockroom.json")
+if grep -q '提交成功' "$SY53/a.out"; then wid=ARA; elif grep -q '提交成功' "$SY53/b.out"; then wid=ARB; else wid=ARC; fi
+out=$(node "$APP" -d "$D53" arrival "$wid" --po PO1 --item P1:4)
+check "成功到货单 $wid 同号同内容重放返回原结果" "重复提交" "$out"
+sum2=$(cksum < "$D53/stockroom.json")
+[ "$sum1" = "$sum2" ] && echo "ok   - 接任交错后重放不改写数据文件" || { echo "FAIL - 重放改写文件"; FAIL=1; }
+node "$APP" -d "$D53" arrival "$wid" --po PO1 --item P1:3 >/dev/null 2>&1 \
+  && { echo "FAIL - 同号改内容未拒绝"; FAIL=1; } || echo "ok   - 接任交错后同号改内容拒绝"
+narr=$(node "$APP" -d "$D53" flow --product P1 --wh W1 | grep -c '单据=AR' || true)
+[ "$narr" = "2" ] && echo "ok   - 流水恰两笔到货（成功的 4 + 收尾 1，被拒单不占编号）" || { echo "FAIL - 到货流水 $narr"; FAIL=1; }
+out=$(node "$APP" -d "$D53" balance P1 --wh W1)
+check "库存与采购进度一致（W1 实存 5）" "余量：商品 P1 仓库 W1 = 5" "$out"
+nlocks=$(ls -a "$D53" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" = "0" ] && echo "ok   - 采购三请求接任交错后无协调文件残留" || { echo "FAIL - 残留：$(ls -a "$D53")"; FAIL=1; }
+unset STOCKROOM_LOCK_WAIT_MS
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
