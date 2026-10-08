@@ -1306,5 +1306,136 @@ check "失败后的已提交状态与后续写入均正常" "P2	螺母" "$out"
 nlocks=$(ls -a "$D37" | grep -c '^\.stockroom\.json\.lock' || true)
 [ "$nlocks" -eq 0 ] && echo "ok   - 回收/释放交错后无锁文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D37")"; FAIL=1; }
 
+echo "== 15. 回收协调者接任/释放竞态：可控同步的确定性交错（非随机并发）=="
+unset STOCKROOM_LOCK_WAIT_MS
+SYNC="$TMP/sync15"
+mkdir -p "$SYNC"
+
+# 等待测试同步标记出现（最多约 20 秒）；同步钩子由 STOCKROOM_TEST_SYNC_DIR 启用。
+wait_marker() {
+  m=$1; i=0
+  while [ ! -e "$m" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
+  [ -e "$m" ]
+}
+
+# 布置“死闸门 + 死协调者”：遗留写入占用与回收协调者都属于已退出进程。
+setup_dead_coord() { # setup_dead_coord <数据目录>
+  d=$1
+  setup_dead_lock "$d"
+  dd=$(dead_pid)
+  printf '%s t\n' "$dd" > "$d/.stockroom.json.lock.$dd.c0"
+  ln "$d/.stockroom.json.lock.$dd.c0" "$d/.stockroom.json.lock.coord"
+}
+
+echo "-- 15.1 两请求观察同一死协调者：一个接任后，迟到者不得移走新存活占用 --"
+D40="$TMP/data40"
+node "$APP" -d "$D40" product add P1 螺丝 >/dev/null
+setup_dead_coord "$D40"
+STOCKROOM_TEST_SYNC_DIR="$SYNC" STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D40" in R1A --wh W1 --item P1:1 >/dev/null 2>&1 &
+R1=$!
+STOCKROOM_TEST_SYNC_DIR="$SYNC" STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D40" in R2A --wh W1 --item P1:2 >/dev/null 2>&1 &
+R2=$!
+# 两个请求都确认同一死协调者，并停在回收 rename 之前（可控同步）
+if wait_marker "$SYNC/coord-reclaim.$R1" && wait_marker "$SYNC/coord-reclaim.$R2"; then
+  echo "ok   - 两个请求先后观察到同一死协调者（同步点就绪）"
+else
+  echo "FAIL - 同步标记未就绪：$(ls "$SYNC")"; FAIL=1
+fi
+# 先放行 R1：回收死协调者、建立新的存活协调者，并停在替换闸门之前
+: > "$SYNC/coord-reclaim.$R1.go"
+wait_marker "$SYNC/gate-rename.$R1" && echo "ok   - R1 已接任为唯一协调者并停在替换闸门前" || { echo "FAIL - R1 未到替换闸门同步点"; FAIL=1; }
+# 再放行 R2：它凭先前判断回收时，移走的已是 R1 刚建立的存活协调者文件——
+# 必须物归原主并让贤，绝不能删除或覆盖
+: > "$SYNC/coord-reclaim.$R2.go"
+sleep 0.5
+if [ -e "$D40/.stockroom.json.lock.coord" ] && [ "$(sed -n '1s/ .*//p' "$D40/.stockroom.json.lock.coord")" = "$R1" ]; then
+  echo "ok   - 迟到请求未移走新建立的存活协调者占用（仍属 R1）"
+else
+  echo "FAIL - 存活协调者占用被移走或篡改：$(ls -a "$D40" | grep lock)"; FAIL=1
+fi
+ls "$D40"/.stockroom.json.lock.coord.reclaimed.* >/dev/null 2>&1 \
+  && { echo "FAIL - 迟到者留下未恢复的回收物：$(ls -a "$D40" | grep lock)"; FAIL=1; } \
+  || echo "ok   - 迟到者让贤后无回收物残留"
+# 放行 R1 替换闸门并完成提交；R2 随后串行取得写入机会
+: > "$SYNC/gate-rename.$R1.go"
+wait $R1; code1=$?
+wait $R2; code2=$?
+[ "$code1" = 0 ] && [ "$code2" = 0 ] && echo "ok   - 两个请求串行取得写入机会均成功（退出 0）" || { echo "FAIL - 退出码异常：$code1/$code2"; FAIL=1; }
+[ ! -e "$SYNC/gate-rename.$R2" ] && echo "ok   - 迟到者从未成为第二个协调者（未动闸门）" || { echo "FAIL - 迟到者曾抵达替换闸门点"; FAIL=1; }
+check "两笔入库都保留（1+2=3）" "余量：商品 P1 仓库 W1 = 3" "$(node "$APP" -d "$D40" balance P1 --wh W1)"
+seqs=$(node "$APP" -d "$D40" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 " ] && echo "ok   - 流水序号 1..2 连续（写入区不重叠）" || { echo "FAIL - 流水序号异常：$seqs"; FAIL=1; }
+docs=$(node "$APP" -d "$D40" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "R1A R2A " ] && echo "ok   - 两笔编号 R1A/R2A 全部保留" || { echo "FAIL - 流水编号异常：$docs"; FAIL=1; }
+nlocks=$(ls -a "$D40" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 结束后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D40")"; FAIL=1; }
+
+echo "-- 15.2 接任途中再退出：协调者替换闸门前崩溃，后续请求自动恢复 --"
+D41="$TMP/data41"
+node "$APP" -d "$D41" product add P1 螺丝 >/dev/null
+setup_dead_coord "$D41"
+STOCKROOM_TEST_SYNC_DIR="$SYNC" STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D41" in R3A --wh W1 --item P1:9 >/dev/null 2>&1 &
+R3=$!
+# 接任者先确认死协调者（放行回收），再停在替换闸门之前
+wait_marker "$SYNC/coord-reclaim.$R3" && : > "$SYNC/coord-reclaim.$R3.go" || { echo "FAIL - 接任者未到回收同步点"; FAIL=1; }
+wait_marker "$SYNC/gate-rename.$R3" && echo "ok   - 接任者已当选协调者并停在替换闸门前" || { echo "FAIL - 接任者未到同步点"; FAIL=1; }
+kill -9 $R3 2>/dev/null; wait $R3 2>/dev/null
+# 协调者崩溃：遗留死协调者文件与死闸门，后续请求（不带同步钩子）须自动恢复
+out=$(node "$APP" -d "$D41" in R4A --wh W1 --item P1:2 2>&1); code=$?
+[ $code -eq 0 ] && echo "ok   - 接任者途中退出后后续请求自动恢复，无需手工删文件" || { echo "FAIL - 未自动恢复：$out"; FAIL=1; }
+check "崩溃者未生效、恢复者入库（余量 2）" "余量：商品 P1 仓库 W1 = 2" "$(node "$APP" -d "$D41" balance P1 --wh W1)"
+out=$(node "$APP" -d "$D41" in R3A --wh W1 --item P1:1)
+check "崩溃请求不占编号，同号可重用" "入库单 R3A 提交成功" "$out"
+# 失败不占新编号：业务拒绝（缺货）不消耗编号，同号改内容可重试
+out=$(node "$APP" -d "$D41" out FAIL1 --wh W1 --item P1:99 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 缺货整单拒绝（退出 1）" || { echo "FAIL - code=$code $out"; FAIL=1; }
+out=$(node "$APP" -d "$D41" in FAIL1 --wh W1 --item P1:3)
+check "失败不占编号，同号改内容可重试" "入库单 FAIL1 提交成功" "$out"
+check "余量精确（2+1+3=6）" "余量：商品 P1 仓库 W1 = 6" "$(node "$APP" -d "$D41" balance P1 --wh W1)"
+# 重放核对：恢复者提交同号同内容只返回原结果，不重复生效
+out=$(node "$APP" -d "$D41" in R4A --wh W1 --item P1:2)
+check "恢复者提交重放返回原结果" "为重复提交" "$out"
+# 采购进度核对：恢复后到货、po show 与重放均精确
+node "$APP" -d "$D41" po register PO1 --supplier S1 --wh W1 --item P1:4 >/dev/null
+out=$(node "$APP" -d "$D41" arrival A4 --po PO1 --item P1:3)
+check "恢复后采购到货正常" "到货单 A4 提交成功" "$out"
+check "po show 进度精确（订购 4 到货 3 待收 1）" "P1	4	3	1	部分到货" "$(node "$APP" -d "$D41" po show PO1 | grep -E '^P1	')"
+out=$(node "$APP" -d "$D41" arrival A4 --po PO1 --item P1:3)
+check "到货同号同内容重放不重复生效" "为重复提交" "$out"
+check "重放后采购进度不变" "P1	4	3	1	部分到货" "$(node "$APP" -d "$D41" po show PO1 | grep -E '^P1	')"
+nlocks=$(ls -a "$D41" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 恢复后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D41")"; FAIL=1; }
+
+echo "-- 15.3 旧请求延迟清理与接任交错：不得删除后来请求的闸门/身份/协调文件 --"
+D42="$TMP/data42"
+node "$APP" -d "$D42" product add P1 螺丝 >/dev/null
+setup_dead_lock "$D42"   # 死闸门（无协调者）：R5 将当选协调者并接任
+STOCKROOM_TEST_SYNC_DIR="$SYNC" STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D42" in R5A --wh W1 --item P1:5 >/dev/null 2>&1 &
+R5=$!
+# R5 当选协调者（无竞争，直接认领），先停在替换闸门前，放行后完成提交，
+# 再停在“闸门已删、身份/协调者文件未清理”的释放点
+wait_marker "$SYNC/gate-rename.$R5" && : > "$SYNC/gate-rename.$R5.go" || { echo "FAIL - R5 未到替换闸门同步点"; FAIL=1; }
+wait_marker "$SYNC/release-gate.$R5" && echo "ok   - R5 已提交并停在释放清理点" || { echo "FAIL - R5 未到释放点"; FAIL=1; }
+[ -e "$D42/.stockroom.json.lock.coord" ] && echo "ok   - R5 的存活协调者文件在清理前仍在册" || { echo "FAIL - 存活协调者文件被提前清理"; FAIL=1; }
+# 此时闸门已释放：R6 直接取得写入机会并提交，同样停在释放清理点
+STOCKROOM_TEST_SYNC_DIR="$SYNC" STOCKROOM_LOCK_WAIT_MS=30000 node "$APP" -d "$D42" in R6B --wh W1 --item P1:2 >/dev/null 2>&1 &
+R6=$!
+wait_marker "$SYNC/release-gate.$R6" && echo "ok   - R6 在 R5 清理未完时取得写入机会并提交" || { echo "FAIL - R6 未到释放点"; FAIL=1; }
+R6ID=$(ls -a "$D42" | grep "^\.stockroom\.json\.lock\.$R6\.")
+[ -n "$R6ID" ] && echo "ok   - R6 的身份文件在册" || { echo "FAIL - R6 身份文件缺失"; FAIL=1; }
+# 放行 R5 的延迟清理：只能删除 R5 自己的协调者文件，绝不动 R6 的身份文件
+: > "$SYNC/release-gate.$R5.go"
+wait $R5; code5=$?
+[ "$code5" = 0 ] && echo "ok   - R5 延迟清理后正常退出" || { echo "FAIL - R5 退出码 $code5"; FAIL=1; }
+[ -e "$D42/$R6ID" ] && echo "ok   - R5 的延迟清理未删除 R6 的身份文件" || { echo "FAIL - R6 身份文件被误删"; FAIL=1; }
+: > "$SYNC/release-gate.$R6.go"
+wait $R6; code6=$?
+[ "$code6" = 0 ] && echo "ok   - R6 正常释放退出" || { echo "FAIL - R6 退出码 $code6"; FAIL=1; }
+check "两笔提交都保留（5+2=7）" "余量：商品 P1 仓库 W1 = 7" "$(node "$APP" -d "$D42" balance P1 --wh W1)"
+seqs=$(node "$APP" -d "$D42" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 " ] && echo "ok   - 交错清理后流水序号 1..2 连续" || { echo "FAIL - 流水序号异常：$seqs"; FAIL=1; }
+nlocks=$(ls -a "$D42" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 交错清理后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D42")"; FAIL=1; }
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi
