@@ -1306,5 +1306,171 @@ check "失败后的已提交状态与后续写入均正常" "P2	螺母" "$out"
 nlocks=$(ls -a "$D37" | grep -c '^\.stockroom\.json\.lock' || true)
 [ "$nlocks" -eq 0 ] && echo "ok   - 回收/释放交错后无锁文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D37")"; FAIL=1; }
 
+echo "== 15. 确定性同步：接任/回收/释放竞态（不靠随机并发碰运气） =="
+# 通过 STOCKROOM_TEST_SYNC 同步点与 STOCKROOM_TEST_CRASH 崩溃注入，精确安排两个请求
+# 先观察同一死协调者、一个接任后另一个继续处理、接任途中再退出、旧请求延迟清理。
+export STOCKROOM_LOCK_WAIT_MS=30000
+
+wait_for() { # wait_for <标记文件>：等待其出现（确定性放行，不靠睡眠猜时机）
+  f=$1; i=0
+  until [ -e "$f" ]; do
+    sleep 0.02; i=$((i+1))
+    [ $i -ge 1500 ] && { echo "FAIL - 等待标记超时：$f"; FAIL=1; return 1; }
+  done
+}
+
+# 布置“遗留写入占用 + 已退出回收协调者”：死闸门（旧写进程 W）与死协调者文件（C）。
+# 协调者文件内容首行必须带其 pid（与真实协调者身份内容一致），否则按不可判定处理。
+setup_dead_coord_lock() { # setup_dead_coord_lock <数据目录>
+  d=$1; mkdir -p "$d"
+  w=$(dead_pid); c=$(dead_pid)
+  printf '%s dead-writer w0\n' "$w" > "$d/.stockroom.json.lock.$w.w0"
+  ln "$d/.stockroom.json.lock.$w.w0" "$d/.stockroom.json.lock"     # 死闸门=旧写进程占用
+  printf '%s dead-coord c0\n' "$c" > "$d/.stockroom.json.lock.$c.c0"
+  ln "$d/.stockroom.json.lock.$c.c0" "$d/.stockroom.json.lock.coord" # 死协调者（接任前退出）
+}
+ino() { stat -f '%i' "$1"; }
+
+echo "-- 15.1 两请求先都确认旧协调者已死；A 接任后 B 才继续，B 不得移走 A 的存活占用 --"
+D40="$TMP/data40"; SY="$TMP/sy40"; rm -rf "$D40" "$SY"; mkdir -p "$SY"
+node "$APP" -d "$D40" product add P1 螺丝 >/dev/null
+setup_dead_coord_lock "$D40"
+# A：在“搬走死协调者前”停下等放行；接任 rename 后持锁再停下（持有存活占用）。
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY'/a-dead","wait":"'$SY'/a-go"},{"point":"take-after","signal":"'$SY'/a-taken","wait":"'$SY'/a-finish"}]' \
+  node "$APP" -d "$D40" in A1 --wh W1 --item P1:10 >"$SY/a.out" 2>&1 &
+AP=$!
+wait_for "$SY/a-dead"
+# B：同样在“搬走死协调者前”停下（此时 A、B 都仅凭旧信息认定协调者 C 已死）。
+STOCKROOM_TEST_SYNC='[{"point":"coord-dead","signal":"'$SY'/b-dead","wait":"'$SY'/b-go"},{"point":"coord-restore","signal":"'$SY'/b-restored"}]' \
+  node "$APP" -d "$D40" in B1 --wh W1 --item P1:7 >"$SY/b.out" 2>&1 &
+BP=$!
+wait_for "$SY/b-dead"
+# 放行 A：A 回收死协调者、接任闸门并停在存活持有状态。
+touch "$SY/a-go"; wait_for "$SY/a-taken"
+sleep 0.2 # 确保 A 已停稳在 take-after（此时闸门/协调者/身份都是 A 的存活硬链接）
+gate_ino_before=$(ino "$D40/.stockroom.json.lock")
+a_id=$(ls "$D40"/.stockroom.json.lock."$AP".* 2>/dev/null | head -1)
+[ -n "$a_id" ] && [ "$(ino "$a_id")" = "$gate_ino_before" ] \
+  && echo "ok   - A 接任后身份文件是闸门同 inode 的存活锚点" \
+  || { echo "FAIL - A 接任后身份锚点异常：$a_id"; FAIL=1; }
+# 放行迟到者 B：它将凭“先前 C 已死”的判断搬走 coord，但搬走的其实是 A 的存活文件。
+touch "$SY/b-go"; wait_for "$SY/b-restored"
+# B 必须已还原：闸门仍是 A 的存活占用，coord 也被还原为同一 inode。
+gate_ino_after=$(ino "$D40/.stockroom.json.lock")
+[ "$gate_ino_before" = "$gate_ino_after" ] \
+  && echo "ok   - 迟到者 B 未移走 A 刚取得的闸门（inode 不变）" \
+  || { echo "FAIL - B 搬走了 A 的闸门（$gate_ino_before -> ${gate_ino_after}）"; FAIL=1; }
+[ -e "$D40/.stockroom.json.lock.coord" ] && [ "$(ino "$D40/.stockroom.json.lock.coord")" = "$gate_ino_after" ] \
+  && echo "ok   - B 把误搬走的存活协调者文件原子还原（coord 仍指向 A）" \
+  || { echo "FAIL - 存活协调者文件未正确还原"; FAIL=1; }
+kill -0 "$AP" 2>/dev/null && echo "ok   - A 在 B 的迟到清理后仍存活持锁" || { echo "FAIL - A 意外退出"; FAIL=1; }
+# 放行 A 完成提交并释放；B 随后串行取得写入机会完成自己的单据。
+touch "$SY/a-finish"
+wait "$AP"; ac=$?
+wait "$BP"; bc=$?
+[ $ac -eq 0 ] && echo "ok   - A 完成提交（退出 0）" || { echo "FAIL - A 退出 ${ac}：$(cat "$SY/a.out")"; FAIL=1; }
+[ $bc -eq 0 ] && echo "ok   - B 等待 A 释放后串行接任并提交（退出 0）" || { echo "FAIL - B 退出 ${bc}：$(cat "$SY/b.out")"; FAIL=1; }
+out=$(node "$APP" -d "$D40" balance P1 --wh W1)
+check "接任竞态后两笔数量全部保留（10+7=17）" "余量：商品 P1 仓库 W1 = 17" "$out"
+nflow=$(node "$APP" -d "$D40" flow --product P1 --wh W1 | grep -c '^#')
+[ "$nflow" -eq 2 ] && echo "ok   - 接任竞态后恰好两笔流水（失败/等待不占编号）" || { echo "FAIL - 流水条数 $nflow"; FAIL=1; }
+seqs=$(node "$APP" -d "$D40" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 " ] && echo "ok   - 接任竞态后流水序号 1、2 连续" || { echo "FAIL - 流水序号不连续：$seqs"; FAIL=1; }
+docs=$(node "$APP" -d "$D40" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | sort | tr '\n' ' ')
+[ "$docs" = "A1 B1 " ] && echo "ok   - 接任竞态后两笔编号 A1、B1 齐全" || { echo "FAIL - 流水编号异常：$docs"; FAIL=1; }
+nlocks=$(ls -a "$D40" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 接任竞态结束后闸门/身份/协调文件全部释放" || { echo "FAIL - 锁残留：$(ls -a "$D40")"; FAIL=1; }
+
+echo "-- 15.2 接任者在接任途中再次退出：取得写入机会前/后退出，后续请求均自动恢复 --"
+crash_takeover() { # crash_takeover <崩溃点> <数据目录> <崩溃单号> <恢复单号>
+  cp=$1; d=$2; crid=$3; okid=$4
+  node "$APP" -d "$d" product add P1 螺丝 >/dev/null
+  setup_dead_lock "$d"
+  STOCKROOM_TEST_CRASH="$cp" node "$APP" -d "$d" in "$crid" --wh W1 --item P1:100 >/dev/null 2>&1 &
+  wait $! 2>/dev/null # 接任者按注入点 SIGKILL 退出（后台执行以抑制作业报告）
+  # 接任者已死：后续请求必须自动回收（死闸门+死协调者+死身份/锚点），无需手工删文件。
+  out=$(node "$APP" -d "$d" in "$okid" --wh W1 --item P1:4 2>&1); code=$?
+  [ $code -eq 0 ] && echo "ok   - 接任者崩于 $cp 后自动恢复，$okid 成功" || { echo "FAIL - $cp 后恢复失败：$out"; FAIL=1; }
+  out=$(node "$APP" -d "$d" balance P1 --wh W1)
+  check "${cp}：崩溃接任者业务不生效、恢复笔完整（余量 4）" "余量：商品 P1 仓库 W1 = 4" "$out"
+  nflow=$(node "$APP" -d "$d" flow --product P1 --wh W1 | grep -c '^#')
+  [ "$nflow" -eq 1 ] && echo "ok   - ${cp}：崩溃接任者不占流水/编号（仅恢复笔 1 条）" || { echo "FAIL - $cp 流水条数 $nflow"; FAIL=1; }
+  docs=$(node "$APP" -d "$d" flow --product P1 --wh W1 | sed -n 's/^#[0-9]*	单据=\([A-Z0-9]*\)	.*/\1/p' | tr '\n' ' ')
+  [ "$docs" = "$okid " ] && echo "ok   - ${cp}：流水只有恢复单 ${okid}，崩溃单 $crid 未占编号" || { echo "FAIL - $cp 流水编号异常：$docs"; FAIL=1; }
+  nlocks=$(ls -a "$d" | grep -c '^\.stockroom\.json\.lock' || true)
+  [ "$nlocks" -eq 0 ] && echo "ok   - ${cp}：恢复后无任何协调文件残留（含死锚点/死身份）" || { echo "FAIL - $cp 锁残留：$(ls -a "$d")"; FAIL=1; }
+}
+crash_takeover after-coord        "$TMP/data41" CR1 OK1   # 当选协调者后、接任闸门前退出
+crash_takeover after-take-link    "$TMP/data42" CR2 OK2   # 接任锚点已建、rename 闸门前退出
+crash_takeover after-take-rename  "$TMP/data43" CR3 OK3   # 接任闸门后（已取得机会）、业务前退出
+
+echo "-- 15.3 较早请求延迟结束/超时清理与新请求接任交错：只清理自己的占用 --"
+D44="$TMP/data44"; SY="$TMP/sy44"; rm -rf "$D44" "$SY"; mkdir -p "$SY"
+node "$APP" -d "$D44" product add P1 螺丝 >/dev/null
+# A 完成业务提交后、释放闸门前停住（存活持有者，数据已落盘）。
+STOCKROOM_TEST_SYNC='{"point":"release-before","signal":"'$SY'/a-rel","wait":"'$SY'/a-go"}' \
+  node "$APP" -d "$D44" in EARLY --wh W1 --item P1:5 >"$SY/a.out" 2>&1 &
+AP=$!
+wait_for "$SY/a-rel"
+# 存活持有者即使“暂停很久”也不被接管：只读查询能读到已提交的 5 件，闸门仍是 A。
+check "A 提交后、释放前暂停期间数据已完整落盘" "余量：商品 P1 仓库 W1 = 5" "$(node "$APP" -d "$D44" balance P1 --wh W1)"
+before=$(ls "$D44"/.stockroom.json.lock* 2>/dev/null)
+# 超时请求 T（等待 0.15s）：退出 1，其 abandon 清理只能删自己的身份文件。
+out=$(STOCKROOM_LOCK_WAIT_MS=150 node "$APP" -d "$D44" in TIMEOUT1 --wh W1 --item P1:1 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 存活持有者暂停期间新请求等待超时退出 1" || { echo "FAIL - 超时请求退出码 ${code}：$out"; FAIL=1; }
+after=$(ls "$D44"/.stockroom.json.lock* 2>/dev/null)
+[ "$before" = "$after" ] && echo "ok   - 超时清理未删除持有者的闸门/身份（只清自己）" || { echo "FAIL - 超时清理误删：before=[$before] after=[$after]"; FAIL=1; }
+check "超时请求不生效、不占编号" "余量：商品 P1 仓库 W1 = 5" "$(node "$APP" -d "$D44" balance P1 --wh W1)"
+kill -0 "$AP" 2>/dev/null && echo "ok   - A 经历超时请求交错后仍存活持锁" || { echo "FAIL - A 意外退出：$(cat "$SY/a.out")"; FAIL=1; }
+# 新请求 B 在 A 释放前任由等待；A 一释放即接任提交，A 的延迟释放不得影响 B 的占用。
+node "$APP" -d "$D44" in LATE --wh W1 --item P1:3 >"$SY/b.out" 2>&1 &
+BP=$!
+sleep 0.3
+touch "$SY/a-go"; wait "$AP"; wait "$BP"
+grep -q '入库单 LATE 提交成功' "$SY/b.out" \
+  && echo "ok   - A 延迟释放后 B 立即接任并提交" || { echo "FAIL - B 未成功接任：$(cat "$SY/b.out")"; FAIL=1; }
+check "较早请求的提交保留、新请求数量完整（5+3=8）" "余量：商品 P1 仓库 W1 = 8" "$(node "$APP" -d "$D44" balance P1 --wh W1)"
+nflow=$(node "$APP" -d "$D44" flow --product P1 --wh W1 | grep -c '^#')
+[ "$nflow" -eq 2 ] && echo "ok   - 超时不占编号，只有 EARLY、LATE 两笔流水" || { echo "FAIL - 流水条数 $nflow"; FAIL=1; }
+seqs=$(node "$APP" -d "$D44" flow --product P1 --wh W1 | sed -n 's/^#\([0-9]*\)	.*/\1/p' | tr '\n' ' ')
+[ "$seqs" = "1 2 " ] && echo "ok   - 延迟释放/接任交错下流水序号 1、2 连续" || { echo "FAIL - 流水序号：$seqs"; FAIL=1; }
+nlocks=$(ls -a "$D44" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 延迟释放交错后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D44")"; FAIL=1; }
+
+echo "-- 15.4 确定性接任交错下竞争采购待收不超量、同号同内容只生效一次、重放返回原结果 --"
+D45="$TMP/data45"; SY="$TMP/sy45"; rm -rf "$D45" "$SY"; mkdir -p "$SY"
+node "$APP" -d "$D45" product add P1 螺丝 >/dev/null
+node "$APP" -d "$D45" po register PO1 --supplier S1 --wh W1 --item P1:5 >/dev/null
+setup_dead_lock "$D45"
+# A 从死闸门接任、到货 4 后持锁暂停；B 在 A 存活持有期间只能等待。
+STOCKROOM_TEST_SYNC='{"point":"take-after","signal":"'$SY'/a-taken","wait":"'$SY'/a-go"}' \
+  node "$APP" -d "$D45" arrival AR1 --po PO1 --item P1:4 >"$SY/a.out" 2>&1 &
+AP=$!
+wait_for "$SY/a-taken"
+( node "$APP" -d "$D45" arrival AR2 --po PO1 --item P1:4 >"$SY/b.out" 2>&1; echo $? >"$SY/b.code" ) &
+BP=$!
+sleep 0.3
+touch "$SY/a-go"; wait "$AP"; wait "$BP"
+[ "$(cat "$SY/b.code")" = "1" ] && echo "ok   - A 到货 4 接任提交后，B 再到货 4 超量被整单拒绝" || { echo "FAIL - B 码=$(cat "$SY/b.code")：$(cat "$SY/b.out")"; FAIL=1; }
+out=$(node "$APP" -d "$D45" arrival AR3 --po PO1 --item P1:1)
+check "剩余待收 1 由 AR3 精确收齐" "待到货 0" "$out"
+out=$(node "$APP" -d "$D45" po show PO1)
+check "接任交错下采购不超量（有效到货 5/5，收齐）" "P1	5	5	0	收齐" "$out"
+# 同号同内容重放只返回原结果、不再生效、不改文件
+sum1=$(cksum < "$D45/stockroom.json")
+out=$(node "$APP" -d "$D45" arrival AR1 --po PO1 --item P1:4)
+check "AR1 同号同内容重放返回原结果" "为重复提交" "$out"
+sum2=$(cksum < "$D45/stockroom.json")
+[ "$sum1" = "$sum2" ] && echo "ok   - 接任交错后重放不改写数据文件" || { echo "FAIL - 重放改写文件"; FAIL=1; }
+# 同号改内容拒绝
+out=$(node "$APP" -d "$D45" arrival AR1 --po PO1 --item P1:3 2>&1); code=$?
+[ $code -eq 1 ] && echo "ok   - 接任交错后同号改内容仍拒绝（退出 1）" || { echo "FAIL - 改内容码 ${code}：$out"; FAIL=1; }
+check "拒绝不影响已提交进度（仍 5/5 收齐）" "P1	5	5	0	收齐" "$(node "$APP" -d "$D45" po show PO1)"
+narr=$(node "$APP" -d "$D45" flow --product P1 --wh W1 | grep -c '单据=AR' || true)
+[ "$narr" -eq 2 ] && echo "ok   - 流水中只有 AR1、AR3 两次到货（AR2 超量不占编号）" || { echo "FAIL - 到货流水数 $narr"; FAIL=1; }
+nlocks=$(ls -a "$D45" | grep -c '^\.stockroom\.json\.lock' || true)
+[ "$nlocks" -eq 0 ] && echo "ok   - 采购接任竞态后无协调文件残留" || { echo "FAIL - 锁残留：$(ls -a "$D45")"; FAIL=1; }
+unset STOCKROOM_LOCK_WAIT_MS
+
 echo
 if [ $FAIL -eq 0 ]; then echo "全部回归检查通过"; else echo "存在失败项"; exit 1; fi

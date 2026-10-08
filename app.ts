@@ -1188,14 +1188,28 @@ function saveStore(dataDir: string, store: Store): void {
 //     后暂停很久，文件年龄与内容完整度从不作为接管依据。
 //   - 持有者进程退出后闸门成为遗留物。多个等待者先竞争唯一的“回收协调者”文件
 //     .stockroom.json.lock.coord（硬链接原子认领，存活期间稳定唯一，死协调者按
-//     死 pid 回收）：只有协调者能动闸门。回收用一次原子“替换 rename”
-//     （rename(自己的身份文件, 闸门)）无缝完成——闸门名全程存在、inode 被整体
-//     换成新持有者，没有“闸门短暂缺失被他人插队”的空隙；非协调者一律等待。
-//     因此回收者绝不可能移走另一个请求刚取得的闸门，多个恢复者只能串行取得
-//     写入机会；结束或失败时也只释放本进程自己的闸门/身份/协调者文件。
+//     死 pid 回收）：只有协调者能动闸门。
+//   - 接任是一次“只增链接”的原子无缝替换：协调者先把自己的身份文件额外 link 成
+//     交接锚点 .stockroom.json.lock.take.<pid>.<nonce>（持有期间稳定保留，作为
+//     闸门 inode 的第二硬链接），再 rename(锚点, 闸门) 覆盖旧死闸门。接任者自始
+//     至终保留自己身份文件的原名，它是闸门 inode 的稳定硬链接，因此“闸门是否
+//     仍属于本请求”始终可凭 inode 判定，不依赖协调者文件内容。
+//   - 回收死协调者时绝不凭“先前读到的死 pid”动手：搬走协调者文件后必须重新读
+//     回其内容并复核 pid 仍已退出，且该 pid 不是本进程；若文件已被接任者换成
+//     新的存活内容（inode/内容已变），立即把刚搬走的文件还原并退出竞争，绝不
+//     删除后来者的协调者/闸门。因此两个恢复者即使都已确认旧协调者退出，先接任
+//     的一方建立存活占用后，迟到方不可能凭旧判断移走或覆盖它，多个恢复者只能
+//     串行取得写入机会。
+//   - 接任者在接任 rename 之前或之后再次退出都不影响后续：它的身份/锚点/协调者
+//     文件都带自己的死 pid，闸门成为新的遗留占用，下一个写请求自动重复同一
+//     回收流程，无需等待或手工删除任何文件。
+//   - 释放只作用于本请求的占用：release 只在闸门 inode 仍等于自己身份 inode 时
+//     删除闸门，并只删本进程自己的身份/锚点/协调者文件；较早请求的结束、业务
+//     失败或超时清理与新请求接任交错时，绝不会删除后来请求的闸门、身份或协调者
+//     文件。仍存活的写进程无论写多久都不会被抢占。
 //   - 异常退出若发生在原子替换之前，本次业务变动完全不生效；发生在替换之后，
 //     完整提交已保留（即使来不及输出成功），重试按已有结果去重。遗留临时文件、
-//     身份/协调者文件与回收物凭 pid 确认持有者已退出后由后续写入者清理，
+//     身份/锚点/协调者文件与回收物凭 pid 确认持有者已退出后由后续写入者清理，
 //     存活请求的文件一律不动。
 //
 // 等待有上限（默认 10 秒，可用环境变量 STOCKROOM_LOCK_WAIT_MS 按毫秒调整）：
@@ -1206,6 +1220,7 @@ function saveStore(dataDir: string, store: Store): void {
 const LOCK_GATE = `.${DATA_FILENAME}.lock`; // 固定闸门名（也兼容旧版单文件锁）
 const LOCK_COORD = `.${DATA_FILENAME}.lock.coord`; // 回收协调者（稳定、唯一）
 const LOCK_PREFIX = `.${DATA_FILENAME}.lock.`; // 各进程身份文件此前缀
+const TAKE_PREFIX = `.${DATA_FILENAME}.lock.take.`; // 接任时的交接锚点（身份文件的额外硬链接）
 const COORD_PREFIX = `.${DATA_FILENAME}.lock.coord.reclaimed.`; // 死协调者回收物
 const RECLAIM_PREFIX = `.${DATA_FILENAME}.lock.reclaimed.`; // 旧版本闸门回收物
 const TMP_PREFIX = `.${DATA_FILENAME}.`;
@@ -1247,6 +1262,53 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** 轮询等待某文件出现（仅供确定性回归的同步钩子使用）。 */
+function waitForFile(path: string, timeoutMs = 60_000): void {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      statSync(path);
+      return;
+    } catch {
+      if (Date.now() >= end) return;
+      sleepSync(10);
+    }
+  }
+}
+
+/**
+ * 仅供本地回归检查使用的确定性同步钩子（未设置 STOCKROOM_TEST_SYNC 时完全无作用）。
+ * 配置为单个对象或对象数组：{"point":"<同步点>","signal":"<到达时创建的文件>","wait":"<继续前等待出现的文件>"}。
+ * 数组时取第一个 point 匹配的项，便于一个进程在多个同步点上受控。
+ * 先 signal 后 wait：到达进程先留下到达标记（内容为其 pid），再阻塞直到测试驱动放行，
+ * 从而可精确安排交错，而非靠随机并发碰运气。
+ * 同步点：coord-dead（读到旧协调者已死、搬走其文件前）、coord-restore（发现搬走的
+ * 是存活接任者、已还原其协调者文件后）、coord-won（当选回收协调者、接任闸门前）、
+ * take-before（接任 rename 前）、take-after（接任 rename 后、进入业务前）、
+ * release-before（释放闸门前）。
+ */
+function testSync(point: string): void {
+  const raw = process.env.STOCKROOM_TEST_SYNC;
+  if (raw === undefined) return;
+  let cfgs: Array<{ point?: string; signal?: string; wait?: string }>;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    cfgs = Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return;
+  }
+  const cfg = cfgs.find((c) => c && c.point === point);
+  if (cfg === undefined) return;
+  if (cfg.signal) {
+    try {
+      writeFileSync(cfg.signal, `${process.pid}\n`);
+    } catch {
+      /* 测试钩子失败不影响正常流程 */
+    }
+  }
+  if (cfg.wait) waitForFile(cfg.wait);
+}
+
 /** 把（可能含符号链接的）数据目录归一为真实路径，使同一目录的不同写法共用一把锁。 */
 function resolveDataDir(dataDir: string): string {
   try {
@@ -1270,91 +1332,133 @@ function lockNamePid(name: string): number | null {
   if (!name.startsWith(LOCK_PREFIX)) return null;
   const rest = name.slice(LOCK_PREFIX.length);
   if (rest === 'coord' || rest.startsWith('coord.')) return null; // 协调者文件，不是任何进程的身份文件
+  if (rest.startsWith('take.')) return null; // 接任锚点，由 takeNamePid 解析
   const dot = rest.indexOf('.');
   const part = dot < 0 ? rest : rest.slice(0, dot);
   return /^\d+$/.test(part) ? Number(part) : null;
+}
+
+/** 接任锚点文件名中的 pid（.stockroom.json.lock.take.<pid>.<nonce>）；无法解析返回 null。 */
+function takeNamePid(name: string): number | null {
+  if (!name.startsWith(TAKE_PREFIX)) return null;
+  const rest = name.slice(TAKE_PREFIX.length);
+  const part = rest.split('.')[0] ?? '';
+  return /^\d+$/.test(part) ? Number(part) : null;
+}
+
+/** 读取协调者文件内容首行记录的 pid；读不到或无法解析返回 null（调用方一律等待，绝不擅动）。 */
+function readCoordPid(coordPath: string): number | null {
+  try {
+    const m = /^(\d+)/.exec(readFileSync(coordPath, 'utf8'));
+    if (m === null) return null;
+    const pid = Number(m[1]);
+    return pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
  * 尝试成为本目录唯一的“回收协调者”：把本进程的身份文件硬链接到固定协调者名。
  * 返回 true 表示当选；false 表示已有存活协调者（调用方应等待，不得自行回收闸门）。
  * 协调者在整个闸门持有期间保持唯一：其他进程在其存活期间只能等待，从根本上
- * 杜绝两个回收者并发替换闸门。死协调者（其记录的 pid 已退出）原子 rename 回收
- * 后重试一次，rename 竞争失败则放弃。
+ * 杜绝两个回收者并发替换闸门。
+ *
+ * 死协调者的回收严格防止“凭先前判断误删接任者”：搬走协调者文件后必须重新读回
+ * 其内容，复核记录的 pid 仍已退出且不是本进程——因为先到的恢复者可能已用同一
+ * 协调者名完成接任（coord 仍是闸门 inode 的存活硬链接）。一旦发现搬走的其实是
+ * 存活接任者的文件，立即原子还原并退出竞争，迟到者绝不会移走或覆盖后来者刚
+ * 建立的占用。
  */
 function tryBecomeCoordinator(dir: string, idPath: string): boolean {
   const coordPath = join(dir, LOCK_COORD);
   for (;;) {
     try {
       linkSync(idPath, coordPath);
+      // 仅供回归：当选协调者后、接任闸门前崩溃（遗留死协调者 + 旧死闸门）。
+      if (process.env.STOCKROOM_TEST_CRASH === 'after-coord') process.kill(process.pid, 'SIGKILL');
+      testSync('coord-won'); // 当选（唯一）回收协调者；随后调用方在 gateIsStale 复核后续任
       return true;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST')
         throw new DataError(`无法获取数据目录写入机会（认领回收协调文件失败）：${(e as Error).message}`);
     }
-    // 已有协调者：仅当能确认其 pid 已退出时才回收；任何无法判定的情况一律等待。
-    let pid = -1;
-    try {
-      const m = /^(\d+)/.exec(readFileSync(coordPath, 'utf8'));
-      if (m !== null) pid = Number(m[1]);
-    } catch {
-      return false;
-    }
-    if (pid <= 0 || pidAlive(pid)) return false;
+    // 已有协调者：仅当能确认其 pid 已退出时才考虑回收；任何无法判定的情况一律等待。
+    let pid = readCoordPid(coordPath);
+    if (pid === null || pid === process.pid || pidAlive(pid)) return false;
+    testSync('coord-dead');
     const trash = `${COORD_PREFIX}${process.pid}.${Math.random().toString(36).slice(2)}`;
+    const trashPath = join(dir, trash);
     try {
-      renameSync(coordPath, join(dir, trash)); // 与其他回收死协调者的进程原子决胜
+      renameSync(coordPath, trashPath); // 与其他回收死协调者的进程原子决胜
     } catch {
       return false; // 他人已处理：下一轮由 link 的 EEXIST 判定新协调者
     }
-    try { unlinkSync(join(dir, trash)); } catch { /* 忽略；后续 cleanStaleFiles 按死 pid 清理 */ }
+    // 关键复核：搬走后重新读取“被搬走的文件”。若它已不是先前那个死协调者
+    // （接任者把 coord 换成了自己的存活硬链接，而我们恰好在其接任之后才完成
+    // 这次 rename），就必须还原，绝不删除后来者的协调者/闸门。
+    const movedPid = readCoordPid(trashPath);
+    if (movedPid === null || movedPid === process.pid || pidAlive(movedPid)) {
+      try {
+        renameSync(trashPath, coordPath); // 原子还原接任者的协调者文件
+      } catch {
+        /* 还原冲突：对方或他人已在处理；保留回收物绝不强删，交由后续凭 pid 清理 */
+      }
+      testSync('coord-restore'); // 已确认：先前的“死”判断失效，已把存活接任者的文件还原
+      return false;
+    }
+    try {
+      unlinkSync(trashPath);
+    } catch {
+      /* 忽略；后续 cleanStaleFiles 按死 pid 清理 */
+    }
     // 循环回到 link 重试：只有一个进程能成功，其余看到新的存活协调者。
   }
 }
 
-/** 列出各进程的锁身份文件名（仅 .stockroom.json.lock.<pid>.<nonce>，不含闸门/协调者）。 */
-function listLockIdentities(dir: string): string[] {
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return names.filter((n) => lockNamePid(n) !== null);
-}
-
 /**
  * 判断固定闸门是否属于已退出的写进程（可安全回收）。
- * 优先按“与闸门同 inode 的身份文件名”中的 pid 判定（新协议，归属不依赖内容）；
- * 没有匹配身份文件时（升级前的旧式单文件锁）回退读取闸门首行 pid，
+ * 依次按“与闸门同 inode 的文件名”定位属主 pid：
+ *   1) 进程身份文件 .stockroom.json.lock.<pid>.<nonce>（新协议，接任也保留原名，
+ *      是最稳定的归属锚点）；
+ *   2) 接任交接锚点 .stockroom.json.lock.take.<pid>.<nonce>（接任瞬间的额外硬链接）；
+ *   3) 协调者文件（pid 记录在内容首行）。
+ * 都没有匹配时回退旧式单文件锁内容 pid。归属只取决于这些记录的 pid 是否存活，
  * 内容无法解析则一律视为不可回收，绝不按文件年龄抢占存活进程。
  * 返回 true 可回收；false 为存活占用或无法判定。
  */
 function gateIsStale(dir: string): boolean {
   const gatePath = join(dir, LOCK_GATE);
-  const coordStatPath = join(dir, LOCK_COORD);
   let gateIno: number | bigint;
   try {
     gateIno = statSync(gatePath).ino;
   } catch {
     return false; // 闸门刚好被释放：调用方下一轮重试即可
   }
-  for (const name of listLockIdentities(dir)) {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return false;
+  }
+  // 1)+2) 身份文件与接任锚点：pid 在文件名里，inode 与闸门相同即属主。
+  for (const name of names) {
+    const pid = lockNamePid(name) ?? takeNamePid(name);
+    if (pid === null) continue;
     try {
-      if (statSync(join(dir, name)).ino === gateIno) return !pidAlive(lockNamePid(name)!);
+      if (statSync(join(dir, name)).ino === gateIno) return !pidAlive(pid);
     } catch {
-      /* 身份文件刚被删除：忽略 */
+      /* 文件刚被删除：忽略 */
     }
   }
-  // 经“无缝替换”取得闸门的持有者：其闸门 inode 同时由固定协调者文件承载，
-  // pid 记录在协调者内容里（身份文件原名已 rename 成闸门）。
-  try {
-    if (statSync(coordStatPath).ino === gateIno) {
-      const m = /^(\d+)/.exec(readFileSync(coordStatPath, 'utf8'));
-      if (m !== null) return !pidAlive(Number(m[1]));
+  // 3) 协调者文件是闸门 inode 的硬链接时，pid 记录在内容首行。
+  const coordPid = readCoordPid(join(dir, LOCK_COORD));
+  if (coordPid !== null) {
+    try {
+      if (statSync(join(dir, LOCK_COORD)).ino === gateIno) return !pidAlive(coordPid);
+    } catch {
+      /* 协调者不存在或不可读：继续旧式回退判定 */
     }
-  } catch {
-    /* 协调者不存在或不可读：继续旧式回退判定 */
   }
   // 旧式单文件锁：仅当能读到明确且已退出的 pid 才回收
   try {
@@ -1367,9 +1471,10 @@ function gateIsStale(dir: string): boolean {
 }
 
 /**
- * 取得写入机会后清理异常退出写进程遗留的临时文件、孤立锁身份文件与各类回收物。
- * 只有文件名中 pid 已退出的才删除；与现存闸门同 inode 的身份文件（当前占用
- * 本身）绝不动，存活请求的文件与现任协调者文件一律不动。
+ * 取得写入机会后清理异常退出写进程遗留的临时文件、孤立锁身份/接任锚点文件与
+ * 各类回收物。只有文件名（或协调者内容）中 pid 已退出的才删除；并且**任何**与
+ * 现存闸门同 inode 的文件都绝不删除——那一定是当前占用本身的硬链接（身份、
+ * 接任锚点或协调者）。存活等待者的身份文件与现任协调者文件凭存活 pid 一律保留。
  */
 function cleanStaleFiles(dir: string): void {
   let names: string[];
@@ -1386,29 +1491,24 @@ function cleanStaleFiles(dir: string): void {
   }
   for (const name of names) {
     let pidPart: number | null = null;
-    let isIdentity = false;
     if (name.startsWith(TMP_PREFIX) && name.endsWith('.tmp')) {
       const s = name.slice(TMP_PREFIX.length, -'.tmp'.length).split('.')[0];
       if (/^\d+$/.test(s)) pidPart = Number(s);
     } else if (name === LOCK_COORD) {
-      try { // 固定协调者文件：pid 记录在内容首行（内容写完后才 link 成此名）
-        const m = /^(\d+)/.exec(readFileSync(join(dir, name), 'utf8'));
-        if (m !== null) pidPart = Number(m[1]);
-      } catch { pidPart = null; }
+      pidPart = readCoordPid(join(dir, name)); // 固定协调者：pid 在内容首行
     } else if (name.startsWith(COORD_PREFIX)) {
       const s = name.slice(COORD_PREFIX.length).split('.')[0]; // 死协调者回收物
       if (/^\d+$/.test(s)) pidPart = Number(s);
     } else if (name.startsWith(RECLAIM_PREFIX)) {
-      const s = name.slice(RECLAIM_PREFIX.length).split('.')[0]; // 死闸门回收物
+      const s = name.slice(RECLAIM_PREFIX.length).split('.')[0]; // 旧版闸门回收物
       if (/^\d+$/.test(s)) pidPart = Number(s);
     } else {
-      pidPart = lockNamePid(name);
-      isIdentity = pidPart !== null;
+      pidPart = lockNamePid(name) ?? takeNamePid(name); // 身份文件或接任锚点
     }
     if (pidPart === null || pidAlive(pidPart)) continue;
-    if (isIdentity && gateIno !== undefined) {
+    if (gateIno !== undefined) {
       try {
-        if (statSync(join(dir, name)).ino === gateIno) continue; // 当前闸门本身：不清理
+        if (statSync(join(dir, name)).ino === gateIno) continue; // 当前占用的任一硬链接：绝不清理
       } catch {
         /* 文件消失：继续尝试删除也无妨 */
       }
@@ -1462,64 +1562,77 @@ function makeIdentity(dir: string): string {
 
 /**
  * 用本进程的身份文件原子认领固定闸门。闸门被死进程遗留时，等待者先竞争唯一的
- * “回收协调者”文件（硬链接原子认领，存活期间稳定唯一，崩溃则按死 pid 回收）：
+ * “回收协调者”文件（硬链接原子认领，存活期间稳定唯一，死协调者按死 pid 回收）：
  *   - 只有协调者会动闸门，且只在 gateIsStale 确认死 pid 后动手；存活持有者的
  *     闸门在其存在期间不会被任何等待者替换（非协调者只能等待）；
- *   - 回收用一次原子“替换 rename”（rename(身份文件, 闸门)）无缝完成：闸门名
- *     全程存在、inode 被整体换成新持有者，不存在“闸门短暂缺失被他人插队”的
- *     空隙，因此回收者绝不可能移走另一个请求刚取得的闸门；
- *   - 协调者在持有闸门期间一直保留协调者文件，与闸门一起释放；它在临界区
- *     崩溃后，死协调者与死闸门（或回收物）由后续写入者凭死 pid 清理并接任，
- *     多个恢复者依旧只能串行取得写入机会。
+ *   - 接任是一次只增链接的原子“替换 rename”：先把身份文件额外 link 成交接
+ *     锚点，再 rename(锚点, 闸门) 覆盖旧死闸门。身份文件原名始终保留，是闸门
+ *     inode 的稳定硬链接；闸门名全程存在、inode 被整体换成新持有者，没有“闸门
+ *     短暂缺失被他人插队”的空隙，回收者绝不可能移走另一个请求刚取得的闸门；
+ *   - 协调者在持有闸门期间一直保留协调者文件，与闸门一起释放；它在接任前或
+ *     接任后崩溃，死协调者、死锚点与死闸门都由后续写入者凭死 pid 清理并接任，
+ *     多个恢复者依旧只能串行取得写入机会，无需等待或手工删文件。
  */
 function claimGate(dir: string, dataDirRaw: string, nonce: string, limit: number): WriteLock {
   const idName = `${LOCK_PREFIX}${process.pid}.${nonce}`;
   const idPath = join(dir, idName);
+  const takeName = `${TAKE_PREFIX}${process.pid}.${nonce}`;
+  const takePath = join(dir, takeName);
   const gatePath = join(dir, LOCK_GATE);
   const coordPath = join(dir, LOCK_COORD);
   const deadline = Date.now() + limit;
 
-  const removeIdentity = (): void => {
-    try { unlinkSync(idPath); } catch { /* 已不存在（替换回收时身份原名已成为闸门）：忽略 */ }
+  const safeUnlink = (p: string): void => {
+    try { unlinkSync(p); } catch { /* 已不存在：忽略 */ }
   };
+  const removeIdentity = (): void => safeUnlink(idPath);
   // 让出/异常路径上释放协调者（仅当它仍是本进程身份文件的硬链接时）。
-  // 注意：只在“无缝替换 rename”尚未发生时调用，那时 idPath 必然仍存在。
+  // 身份文件原名在整个流程中保留，故这里的 inode 归属判定始终可靠。
   const releaseCoordIfMine = (): void => {
     try {
       if (statSync(coordPath).ino === statSync(idPath).ino) unlinkSync(coordPath);
     } catch { /* 已不存在：忽略 */ }
   };
+  // 放弃本次取得机会时的统一清理：只删本进程自己的身份/锚点/协调者文件。
+  const abandon = (): void => {
+    releaseCoordIfMine();
+    safeUnlink(takePath);
+    removeIdentity();
+  };
 
   const finish = (heldCoord: boolean): WriteLock => {
-    cleanStaleFiles(dir); // 取得写入机会后清理已退出进程遗留的临时/身份/协调文件
-    // 经协调者无缝替换取得闸门后，身份文件原名已 rename 成闸门名，同 inode 的另一个
-    // 硬链接是协调者文件；直接 link 取得闸门时，同 inode 的另一个硬链接是身份文件。
-    const selfPath = heldCoord ? coordPath : idPath;
+    cleanStaleFiles(dir); // 取得写入机会后清理已退出进程遗留的临时/身份/锚点/协调文件
     let released = false;
     return {
       release(): void {
         if (released) return;
         released = true;
-        let mine = false;
-        // 只在闸门仍指向本进程（同 inode）时删闸门，绝不删除他人占用。
+        testSync('release-before');
+        // 以本进程身份文件的 inode 作为唯一自身锚点：只有闸门仍指向本请求时才
+        // 删闸门，绝不删除后来接任者已建立的占用。
+        let selfIno: number | bigint | undefined;
         try {
-          mine = statSync(gatePath).ino === statSync(selfPath).ino;
-          if (mine) unlinkSync(gatePath);
+          selfIno = statSync(idPath).ino;
         } catch {
-          mine = heldCoord; // 闸门已缺失：协调者路径仍可独立判断归属（见下）
+          selfIno = undefined;
         }
-        removeIdentity(); // 替换回收时身份原名已不存在，删除被忽略
+        if (selfIno !== undefined) {
+          try {
+            if (statSync(gatePath).ino === selfIno) unlinkSync(gatePath);
+          } catch { /* 闸门已缺失：本就无需释放 */ }
+        }
+        // 只删除本进程自己的身份、锚点与协调者文件。
+        safeUnlink(idPath);
+        safeUnlink(takePath); // 正常接任后锚点已 rename 成闸门，此处通常不存在
         if (heldCoord) {
-          // 协调者文件是本进程身份的硬链接：闸门确认归属后即可安全删除；
-          // 若闸门已缺失，则仅当协调者文件记录的是本进程 pid 时才删。
-          if (mine) {
-            try { unlinkSync(coordPath); } catch { /* 忽略 */ }
-          } else {
-            try {
-              const m = /^(\d+)/.exec(readFileSync(coordPath, 'utf8'));
-              if (m !== null && Number(m[1]) === process.pid) unlinkSync(coordPath);
-            } catch { /* 忽略：遗留协调者由后续写入者凭死 pid 回收 */ }
-          }
+          try {
+            if (selfIno !== undefined && statSync(coordPath).ino === selfIno) {
+              unlinkSync(coordPath);
+            } else {
+              const cp = readCoordPid(coordPath); // 身份文件缺失时兜底：凭内容 pid
+              if (cp === process.pid) unlinkSync(coordPath);
+            }
+          } catch { /* 遗留协调者由后续写入者凭死 pid 回收 */ }
         }
       },
     };
@@ -1543,8 +1656,7 @@ function claimGate(dir: string, dataDirRaw: string, nonce: string, limit: number
       return finish(heldCoord);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
-        if (amCoordinator) releaseCoordIfMine();
-        removeIdentity();
+        abandon();
         throw new DataError(`无法获取数据目录写入机会（认领锁闸门失败）：${(e as Error).message}`);
       }
     }
@@ -1552,49 +1664,59 @@ function claimGate(dir: string, dataDirRaw: string, nonce: string, limit: number
     // 2) 闸门被占且属已退出进程：竞争唯一回收协调者，只有协调者能回收闸门。
     if (gateIsStale(dir)) {
       if (!amCoordinator) amCoordinator = tryBecomeCoordinator(dir, idPath);
-      if (amCoordinator) {
+      if (amCoordinator && gateIsStale(dir)) {
         // 成为协调者后再次确认陈旧（此间状态可能已变化）。
-        if (gateIsStale(dir)) {
-          // 无缝替换：原子把自己的身份文件 rename 到闸门名，旧死闸门被覆盖。
-          // 闸门名全程存在，无任何空隙可供他人插队。
-          try {
-            renameSync(idPath, gatePath);
-          } catch (e2) {
-            // 闸门刚好被释放（删除而非替换）：退回用 link 认领。
-            if ((e2 as NodeJS.ErrnoException).code !== 'ENOENT' && (e2 as NodeJS.ErrnoException).code !== 'EEXIST') {
-              releaseCoordIfMine();
-              removeIdentity();
-              throw new DataError(`无法获取数据目录写入机会（回收锁闸门失败）：${(e2 as Error).message}`);
-            }
+        // 只增链接的无缝接任：身份文件额外 link 出一个交接锚点，再把锚点
+        // 原子 rename 覆盖到闸门名。身份文件原名保留，闸门全程存在。
+        testSync('take-before');
+        try {
+          linkSync(idPath, takePath);
+        } catch (e2) {
+          if ((e2 as NodeJS.ErrnoException).code === 'EEXIST') {
+            // 极小概率同名残留：仅当它已是本进程身份的硬链接时续用，否则报错让出。
+            let same = false;
             try {
-              linkSync(idPath, gatePath);
-            } catch (e3) {
-              if ((e3 as NodeJS.ErrnoException).code === 'EEXIST') {
-                releaseCoordIfMine();
-                amCoordinator = false;
-                continue; // 已有新的存活持有者：让贤并等待
-              }
-              releaseCoordIfMine();
-              removeIdentity();
-              throw new DataError(`无法获取数据目录写入机会（认领锁闸门失败）：${(e3 as Error).message}`);
+              same = statSync(takePath).ino === statSync(idPath).ino;
+            } catch {
+              same = false;
             }
+            if (!same) {
+              abandon();
+              throw new DataError(`无法获取数据目录写入机会（创建接任锚点失败）：${(e2 as Error).message}`);
+            }
+          } else {
+            abandon();
+            throw new DataError(`无法获取数据目录写入机会（创建接任锚点失败）：${(e2 as Error).message}`);
           }
-          return finish(true); // 协调者身份随闸门持有到 release
         }
-        // 闸门已不属死进程：释放协调者身份，回到普通等待。
+        // 仅供回归：接任锚点已建、闸门 rename 之前崩溃（取得写入机会前退出）。
+        if (process.env.STOCKROOM_TEST_CRASH === 'after-take-link') process.kill(process.pid, 'SIGKILL');
+        try {
+          renameSync(takePath, gatePath); // 覆盖旧死闸门：唯一协调者 + 死属主，单方向、无竞争空隙
+        } catch (e3) {
+          abandon();
+          throw new DataError(`无法获取数据目录写入机会（接任锁闸门失败）：${(e3 as Error).message}`);
+        }
+        // 仅供回归：接任 rename 完成、进入业务前崩溃（接任者已取得写入机会后退出，
+        // 留下新死闸门 + 死协调者/身份/锚点，后续请求须自动再接任）。
+        if (process.env.STOCKROOM_TEST_CRASH === 'after-take-rename') process.kill(process.pid, 'SIGKILL');
+        testSync('take-after');
+        return finish(true); // 协调者身份随闸门持有到 release
+      }
+      if (amCoordinator) {
+        // 自己是协调者但闸门已被合法存活持有者占据（接任前状态变化）：让贤。
         releaseCoordIfMine();
         amCoordinator = false;
       }
     } else if (amCoordinator) {
-      // 自己是协调者但闸门已被合法存活持有者占据：让贤。
+      // 自己是协调者但闸门属于存活进程：让贤并等待。
       releaseCoordIfMine();
       amCoordinator = false;
     }
 
     // 3) 闸门属于存活进程（或等待现任协调者完成回收）：在等待上限内轮询。
     if (limit === 0 || Date.now() >= deadline) {
-      if (amCoordinator) releaseCoordIfMine();
-      removeIdentity();
+      abandon();
       throw busyError();
     }
     sleepSync(COORD_POLL_MS);
